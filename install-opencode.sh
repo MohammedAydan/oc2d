@@ -21,6 +21,8 @@ PURGE=0
 UPGRADE=0
 STRICT_PORT=0
 CORS_EXTRA=""
+PW_MODE="auto"        # auto | given | generate; auto prompts only on a TTY
+PW_SOURCE=""          # user | generated | reused — decided once the value is final
 
 INSTALL_URL="https://opencode.ai/v2/install"      # V2 only; V1 is not wire-compatible
 LATEST_URL="https://opencode.ai/update/api/latest/cli/npm"
@@ -40,6 +42,9 @@ BIN=""
 TMPDIR_SELF=""
 TMPDIRS=()            # every temp dir created, so the trap can remove all of them
 PRISTINE_SITES=""      # pre-existing Caddy hostnames, for the production-safety audit
+SERVER_USER="opencode" # the only login user OpenCode accepts
+MIN_PASSWORD_LEN=12    # below this we warn and require an explicit confirmation
+MAX_PROMPT_ATTEMPTS=3  # interactive entry attempts before giving up
 
 # --- output ---
 if [ -t 1 ]; then B=$'\033[1m'; G=$'\033[32m'; Y=$'\033[33m'; R=$'\033[31m'; N=$'\033[0m'
@@ -47,6 +52,7 @@ else B=""; G=""; Y=""; R=""; N=""; fi
 step() { printf '%s==>%s %s\n' "$B" "$N" "$*"; }
 ok()   { printf '%s  ok%s %s\n' "$G" "$N" "$*"; }
 warn() { printf '%swarn%s %s\n' "$Y" "$N" "$*" >&2; }
+err()  { printf '%serror%s %s\n' "$R" "$N" "$*" >&2; }   # not fatal on its own
 die()  { printf '%serror%s %s\n' "$R" "$N" "$*" >&2; exit 1; }
 
 # Last statement must succeed: a failing EXIT trap replaces the script's status.
@@ -74,7 +80,8 @@ Install OpenCode 2 behind a Caddy reverse proxy with automatic HTTPS.
 
   --domain <d>       Domain to serve with HTTPS (required)
   --port <n>         Internal OpenCode port        (default: 4096)
-  --password <pw>    OpenCode password             (default: generated once)
+  --password <pw>    Use this password              (skips the prompt)
+  --generate-password  Skip the prompt, generate a random password
   --cors <origin>    Extra allowed CORS origin    (repeatable)
   --skip-dns-check   Do not verify the A record
   --upgrade          Reinstall OpenCode even if it is already current
@@ -83,11 +90,22 @@ Install OpenCode 2 behind a Caddy reverse proxy with automatic HTTPS.
   --purge            With --uninstall, also delete the binary and config
   -h, --help         This message
 
+Password selection, in order of precedence:
+  --password <pw>      use it verbatim
+  --generate-password  generate a strong random one
+  neither, on a TTY    prompt (hidden input, confirmed twice)
+  neither, no TTY      reuse the stored password, or generate one
+                       (the safe default for CI and piped runs)
+
+An existing install keeps its stored password unless you pass --password or
+--generate-password, so re-running never silently invalidates live sessions.
+Change it later with: ./change-password.sh
+
 Pre-flight detection: an existing healthy Caddy is reused and merged into, never
 overwritten; an existing OpenCode 2 is kept unless --upgrade is given. Both
 services are enabled and linger is set, so the stack survives a reboot.
 
-Environment: OPENCODE_PASSWORD sets the password when --password is absent.
+Environment: OPENCODE_PASSWORD sets the password when no password flag is given.
 EOF
 }
 
@@ -97,7 +115,13 @@ parse_args() {
     case "$1" in
       --domain)    DOMAIN="${2:-}"; shift 2 ;;
       --port)      PORT="${2:-}"; shift 2 ;;
-      --password)  PASSWORD="${2:-}"; shift 2 ;;
+      --password)
+        # An empty value would leave OPENCODE_PASSWORD= empty, which makes
+        # OpenCode mint a new random password on every start.
+        [ $# -ge 2 ] || die "--password needs a value"
+        [ -n "$2" ] || die "--password needs a non-empty value"
+        PASSWORD="$2"; PW_MODE="given"; shift 2 ;;
+      --generate-password) PW_MODE="generate"; shift ;;
       --cors)      CORS_EXTRA="${CORS_EXTRA} ${2:-}"; shift 2 ;;
       --skip-dns-check) SKIP_DNS=1; shift ;;
       --upgrade)   UPGRADE=1; shift ;;
@@ -109,6 +133,9 @@ parse_args() {
     esac
   done
   [ -n "$DOMAIN" ] || { usage >&2; die "--domain is required"; }
+  if [ "$PW_MODE" = "given" ] && [ "${OPENCODE_PASSWORD:-}" != "" ] && [ "$OPENCODE_PASSWORD" != "$PASSWORD" ]; then
+    warn "both --password and OPENCODE_PASSWORD are set; using --password"
+  fi
   DOMAIN="${DOMAIN#https://}"; DOMAIN="${DOMAIN#http://}"; DOMAIN="${DOMAIN%/}"
   DOMAIN="${DOMAIN%%/*}"
   if ! [[ "$PORT" =~ ^[0-9]+$ ]] || [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
@@ -409,18 +436,156 @@ generate_caddyfile() {
   ok "site block for $DOMAIN -> 127.0.0.1:$PORT"
 }
 
+# --- password ---
+# Prompts go to stderr so that anything capturing stdout still gets clean output.
+ask() { printf '%s' "$1" >&2; IFS= read -r reply || die "could not read from stdin"; printf '\n' >&2; }
+
+# 21 random base62 characters (~125 bits) behind a fixed class prefix, so the
+# result is guaranteed to contain a lowercase, an uppercase and a digit. `head`
+# closes the pipe early, so tr dies of SIGPIPE: the `|| true` keeps pipefail from
+# turning that into a fatal error inside the command substitution.
+generate_password() {
+  printf '%s' "aA1$(LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom 2>/dev/null | head -c 21 || true)"
+}
+
+# Hard rejections, applied to every source (prompt, --password, env var): a
+# password on this list, or one equal to the login user, is a public secret.
+password_blocked() {
+  local pw="${1,,}" b
+  [ "$pw" = "$SERVER_USER" ] && return 0
+  for b in password 123456 admin opencode changeme letmein qwerty; do
+    [ "$pw" = "$b" ] && return 0
+  done
+  return 1
+}
+
+# Soft warnings, never fatal: the user is told and allowed to proceed.
+# The single-character-class cases are tested first so the message names the
+# actual problem ("is all digits") instead of a symptom of it ("contains no
+# lowercase letter").
+password_weak_reason() {
+  local pw="$1"
+  if [ "${#pw}" -lt "$MIN_PASSWORD_LEN" ]; then printf 'shorter than %s characters' "$MIN_PASSWORD_LEN"; return 0; fi
+  case "$pw" in *[!0-9]*) ;; *) printf 'is all digits'; return 0 ;; esac
+  case "$pw" in *[!a-z]*) ;; *) printf 'is all lowercase letters'; return 0 ;; esac
+  case "$pw" in *[!A-Z]*) ;; *) printf 'is all uppercase letters'; return 0 ;; esac
+  case "$pw" in *[A-Za-z0-9]*) ;; *) printf 'uses only symbols'; return 0 ;; esac
+  case "$pw" in *[a-z]*) ;; *) printf 'contains no lowercase letter'; return 0 ;; esac
+  case "$pw" in *[A-Z]*) ;; *) printf 'contains no uppercase letter'; return 0 ;; esac
+  case "$pw" in *[0-9]*) ;; *) printf 'contains no digit'; return 0 ;; esac
+  return 1
+}
+
+# Reads the password twice with echo suppressed, so it never reaches the screen,
+# the scrollback or the shell history file.
+prompt_password() {
+  local attempt=0 pw pw2 reason
+  while [ "$attempt" -lt "$MAX_PROMPT_ATTEMPTS" ]; do
+    attempt=$((attempt + 1))
+    printf '%sEnter password for OpenCode (user: %s): %s' "$B" "$SERVER_USER" "$N" >&2
+    IFS= read -r -s pw || die "could not read the password; aborting"
+    printf '\n' >&2
+
+    # An empty entry is not an error: offer to do the choosing instead.
+    if [ -z "$pw" ]; then
+      warn "no password entered."
+      ask "Generate a strong random password instead? [Y/n] "
+      case "${reply,,}" in
+        ""|y|yes) PASSWORD="$(generate_password)"; PW_SOURCE="generated"
+                 ok "generated password: $PASSWORD"; return 0 ;;
+        *)        warn "password entry cancelled (attempt $attempt/$MAX_PROMPT_ATTEMPTS)"; continue ;;
+      esac
+    fi
+
+    if password_blocked "$pw"; then
+      err "that password is on the blocklist (or is the username). Choose something else."
+      continue
+    fi
+
+    printf '%sConfirm password: %s' "$B" "$N" >&2
+    IFS= read -r -s pw2 || die "could not read the confirmation; aborting"
+    printf '\n' >&2
+    if [ "$pw" != "$pw2" ]; then
+      err "passwords do not match (attempt $attempt/$MAX_PROMPT_ATTEMPTS)"
+      continue
+    fi
+
+    # Short or single-class passwords need a deliberate yes, not a default.
+    if reason="$(password_weak_reason "$pw")"; then
+      warn "weak password: it $reason."
+      ask "Use it anyway? [y/N] "
+      case "${reply,,}" in
+        y|yes) : ;;
+        *) warn "rejected (attempt $attempt/$MAX_PROMPT_ATTEMPTS)"; continue ;;
+      esac
+    fi
+
+    PASSWORD="$pw"; PW_SOURCE="user"
+    ok "password accepted (as configured by user)"
+    return 0
+  done
+  die "no valid password after $MAX_PROMPT_ATTEMPTS attempts. Use --password or --generate-password for unattended runs."
+}
+
+# Called from main() before any system change, so a bad password cannot leave a
+# half-configured host behind.
+resolve_password() {
+  case "$PW_MODE" in
+    given)
+      PW_SOURCE="user"
+      password_blocked "$PASSWORD" \
+        && die "the password given with --password is on the blocklist (or is the username '$SERVER_USER'). Choose a different one."
+      return 0 ;;
+    generate)
+      PASSWORD="$(generate_password)"; PW_SOURCE="generated"
+      ok "generated password: $PASSWORD"
+      return 0 ;;
+  esac
+
+  # Auto. Only a real terminal gets a prompt: piped input and CI must never
+  # block on stdin, and must never receive a password typed into a pipe.
+  if [ -t 0 ]; then
+    step "Setting the OpenCode password"
+    prompt_password
+    return 0
+  fi
+  ok "no password flags and no TTY: using the stored password, or generating one"
+  return 0
+}
+
 # --- opencode unit ---
 create_systemd_service() {
   step "Writing systemd user unit: $UNIT_PATH"
   mkdir -p "$UNIT_DIR" "$CONFIG_DIR"
+  chmod 700 "$CONFIG_DIR"   # holds the password file
 
   # Reuse the stored password: OpenCode mints a random one per start otherwise,
   # so every crash-restart would silently invalidate the user's session.
-  if [ -z "$PASSWORD" ] && [ -f "$ENV_PATH" ]; then
-    PASSWORD="$(sed -n 's/^OPENCODE_PASSWORD=//p' "$ENV_PATH" | head -1)"
+  #
+  # Precedence: an explicit --password/--generate-password or a TTY prompt, then
+  # the stored value, then OPENCODE_PASSWORD, then a fresh random password.
+  local stored=""
+  if [ -f "$ENV_PATH" ]; then
+    stored="$(sed -n 's/^OPENCODE_PASSWORD=//p' "$ENV_PATH" | head -1)"
+    # An auto-generated value is deliberately never reused when the user asked
+    # for a new one, so discard the stored one whenever we already have a choice.
+    [ "$PW_SOURCE" = "user" ] && [ "$stored" = "$PASSWORD" ] && stored=""
+    if [ "$PW_SOURCE" = "generated" ] && [ -n "$stored" ]; then
+      warn "replacing the stored password with the newly generated one"
+    fi
   fi
-  [ -n "$PASSWORD" ] || PASSWORD="${OPENCODE_PASSWORD:-}"
-  [ -n "$PASSWORD" ] || PASSWORD="$(head -c 24 /dev/urandom | base64 | tr -d '/+=' | cut -c1-24)"
+
+  if [ -z "$PASSWORD" ]; then
+    if [ -n "$stored" ]; then
+      PASSWORD="$stored"; PW_SOURCE="reused"
+      ok "reusing the stored password (unchanged: live sessions stay valid)"
+    elif [ -n "${OPENCODE_PASSWORD:-}" ]; then
+      PASSWORD="$OPENCODE_PASSWORD"; PW_SOURCE="user"
+      ok "using OPENCODE_PASSWORD from the environment (as configured by user)"
+    else
+      PASSWORD="$(generate_password)"; PW_SOURCE="generated"
+    fi
+  fi
   printf 'OPENCODE_PASSWORD=%s\n' "$PASSWORD" > "$ENV_PATH"
   chmod 600 "$ENV_PATH"   # holds a secret
   ok "config dir ready: $CONFIG_DIR (password stored 0600 in env)"
@@ -759,6 +924,15 @@ print_summary() {
   issuer="$(cert_field -issuer)"
   notafter="$(cert_field -enddate)"
 
+  # A password is echoed back only when this run generated it. Anything the
+  # operator chose, or a value reused from a previous install, is reported as
+  # "as configured by user" so a re-run never reprints a live secret.
+  local pw_line
+  case "$PW_SOURCE" in
+    generated) pw_line="$PASSWORD" ;;
+    *)         pw_line="(as configured by user)" ;;
+  esac
+
   cat <<EOF
 
 ========================================
@@ -771,15 +945,16 @@ print_summary() {
  Backend:          http://127.0.0.1:$PORT  (loopback only)
  Certificate:      ${issuer:-issuer unknown}
                    valid until ${notafter:-unknown}
- Password:         $PASSWORD   (login user "opencode")
+ Password:         $pw_line   (login user "$SERVER_USER")
  Logs (OpenCode):  journalctl --user -u $UNIT_NAME -f
  Logs (Caddy):     journalctl -u caddy -f
  Restart (OpenCode): systemctl --user restart $UNIT_NAME
  Restart (Caddy):    sudo systemctl restart caddy
 ========================================
 
-Open https://$DOMAIN in a browser and log in as user "opencode".
+Open https://$DOMAIN in a browser and log in as user "$SERVER_USER".
 Renewal is automatic (Caddy reloads certs ~30 days before expiry).
+To change the password later, run: ./change-password.sh
 Remove with: bash install-opencode.sh --uninstall [--purge]
 EOF
 }
@@ -827,6 +1002,10 @@ main() {
   check_prerequisites
 
   if [ "$DO_UNINSTALL" -eq 1 ]; then uninstall; exit 0; fi
+
+  # Before any system change: a rejected password must not leave a host that is
+  # half-configured.
+  resolve_password
 
   check_dns
   check_port

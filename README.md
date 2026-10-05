@@ -27,7 +27,8 @@ config and credentials.
 |---|---|---|
 | `--domain <d>` | **required** | Domain to serve with automatic HTTPS |
 | `--port <n>` | `4096` | Internal OpenCode port. Busy → auto-shifts |
-| `--password <pw>` | generated | Persisted, so restarts don't invalidate your session |
+| `--password <pw>` | see [Password](#password) | Use it verbatim; skips the prompt |
+| `--generate-password` | off | Skip the prompt, generate a random password |
 | `--cors <origin>` | served domain | Extra allowed CORS origin; repeatable |
 | `--skip-dns-check` | off | Proceed even if the A record doesn't point here |
 | `--upgrade` | off | Reinstall OpenCode even if already current |
@@ -36,7 +37,97 @@ config and credentials.
 | `--purge` | | With `--uninstall`, also delete the binary and password |
 | `-h`, `--help` | | Usage |
 
-Env: `OPENCODE_PASSWORD` sets the password when `--password` is absent.
+Env: `OPENCODE_PASSWORD` sets the password when no password flag is given.
+
+## Password
+
+The login user is always `opencode`. The password is chosen at install time and
+can be changed afterwards without reinstalling anything.
+
+### Choosing it during install
+
+| How you run it | What happens |
+|---|---|
+| `./install-opencode.sh --domain d` in a terminal | **Interactive prompt** — hidden input, confirmed twice |
+| the same, but piped or in CI (`echo "" \| ./install-opencode.sh …`) | **No prompt.** Reuses the stored password, or generates one |
+| `… --password 'MyStrongPass123!'` | Uses it verbatim, no prompt |
+| `… --generate-password` | Generates a strong random password, printed once |
+
+```bash
+# Install with interactive prompt (recommended)
+./install-opencode.sh --domain example.com
+
+# Install with a specific password
+./install-opencode.sh --domain example.com --password 'MyStrongPass123!'
+
+# Install with auto-generated password
+./install-opencode.sh --domain example.com --generate-password
+```
+
+A prompt is shown **only when stdin is a terminal**, so piped runs, `systemd`
+units and CI never block waiting for input.
+
+An existing install **keeps its stored password** unless you pass `--password` or
+`--generate-password`. Re-running the installer to upgrade something else
+therefore never silently logs you out.
+
+### Strength rules
+
+Rejected outright, on every input path including `--password`: `password`,
+`123456`, `admin`, `opencode`, `changeme`, `letmein`, `qwerty`, and anything
+equal to the username.
+
+Warned about but allowed after an explicit `y` at the prompt: shorter than 12
+characters, or a single character class (all digits, all lowercase, all
+uppercase, only symbols).
+
+### Changing it later
+
+```bash
+# Change the password interactively (recommended)
+./change-password.sh
+
+# Change the password non-interactively
+./change-password.sh --password 'NewStrongPass456!'
+
+# Auto-generate a new password
+./change-password.sh --generate
+```
+
+`change-password.sh` stops `opencode.service`, rewrites the single
+`OPENCODE_PASSWORD=` line — any other lines in the file are preserved — starts
+the service again and waits for the backend to answer on loopback.
+
+**If the service does not come back, the previous password is restored
+automatically**, so a failed change can never leave you locked out. The script
+refuses to run if `~/.config/opencode/env` or `opencode.service` is missing, and
+tells you to run the installer first.
+
+### Where it is stored
+
+`~/.config/opencode/env`, mode `0600`, in a `0700` directory:
+
+```
+OPENCODE_PASSWORD=…
+```
+
+The unit passes it in through `EnvironmentFile`, so it never appears in
+`systemctl show` output. Interactive entry uses `read -s`, so the password is
+not echoed and never reaches your shell history. A password you typed is not
+printed back; only an auto-generated one is shown, and only once.
+
+### If you lose the password
+
+Run `./change-password.sh` **on the host** — it needs no login and no old
+password.
+
+If you cannot run it (no SSH access, for instance), edit the file by hand and
+restart the service:
+
+```bash
+nano ~/.config/opencode/env            # set OPENCODE_PASSWORD=…
+systemctl --user restart opencode.service
+```
 
 ## Pre-flight detection
 
@@ -84,6 +175,8 @@ curl -s -o /dev/null -w '%{http_code}\n' https://example.com/
 ## Access and operations
 
 Open the printed URL and log in with user `opencode` and the printed password.
+If you chose the password yourself the installer prints
+`Password: (as configured by user)` instead of echoing it back.
 
 ```bash
 # OpenCode
@@ -91,6 +184,9 @@ systemctl --user status  opencode.service
 systemctl --user restart opencode.service
 systemctl --user stop     opencode.service
 journalctl --user -u opencode.service -f
+
+# Change the password (see the Password section)
+./change-password.sh
 
 # Caddy
 sudo systemctl status  caddy
@@ -113,8 +209,13 @@ expiry.
   `.bak` and merged into — never overwritten — and validated before reload, with
   rollback on failure. Pre-existing sites are probed after the run to prove they
   were not broken.
-- The password is stored `0600` in `~/.config/opencode/env` and passed through
-  `EnvironmentFile`, so it does not appear in `systemctl show` output.
+- The password is stored `0600` in `~/.config/opencode/env` (in a `0700`
+  directory) and passed through `EnvironmentFile`, so it does not appear in
+  `systemctl show` output. Neither script echoes it into logs or shell history.
+- **Avoid backslashes and edge spaces in your password.** systemd's
+  `EnvironmentFile` treats a backslash as an escape character and trims leading
+  and trailing whitespace, so those would be stored but not received exactly as
+  typed. Both scripts warn if your password contains either.
 - The unit uses systemd's `%h`, so nothing is hardcoded to `/home/<user>`.
 
 ## Uninstall

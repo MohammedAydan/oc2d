@@ -2,6 +2,86 @@
 
 All notable changes to this project are documented here.
 
+## [0.1.3] — 2026-10-05
+
+Lets the operator choose the OpenCode password at install time, and adds a
+standalone script to change it later. The password used to be printed once at
+install and never changeable.
+
+### Added
+
+- **Interactive password prompt during install.** With no password flag and a
+  terminal on stdin, the installer asks for the password twice with hidden input
+  (`read -s`), reports a mismatch and retries up to 3 times, and offers to
+  generate a strong random password if the entry is left empty. The prompt is
+  shown **only when stdin is a TTY**, so piped runs, CI and `systemd` units keep
+  the previous non-interactive behaviour instead of blocking on input.
+- **`change-password.sh`.** Changes the password of an existing install without
+  reinstalling. It verifies the environment first (refusing with a clear error if
+  `~/.config/opencode/env` or `opencode.service` is missing), stops the service,
+  waits for it to actually stop, rewrites the single `OPENCODE_PASSWORD=` line
+  **preserving any other lines in the file**, starts the service again, waits for
+  it to become active, then verifies the unit is `active` and that the backend
+  answers HTTP on loopback. Prints a success summary including the login URL,
+  discovered from the Caddyfile by finding the site block that proxies to the
+  backend port.
+- **Atomic update with rollback.** The env file is copied to a temp backup
+  before it is edited, and an `EXIT` trap restores it if the change does not
+  complete. A failed change therefore leaves the **previous password working**
+  rather than a service that is stopped or half-changed.
+- **Password strength validation** on every input path, including `--password`:
+  rejects `password`, `123456`, `admin`, `opencode`, `changeme`, `letmein`,
+  `qwerty` and anything equal to the username `opencode`; warns (allowed after an
+  explicit confirmation) below 12 characters or when the password uses a single
+  character class (all digits, all lowercase, all uppercase, only symbols).
+- **New flags:** `--generate-password` on the installer, `--password` and
+  `--generate` on `change-password.sh`.
+- The config directory is now created and enforced at mode `0700`.
+
+### Changed
+
+- A generated password is now 24 characters from base62 with a guaranteed
+  lowercase, uppercase and digit, instead of an unvalidated random string.
+- The install summary prints `Password: (as configured by user)` instead of
+  echoing a password the operator typed, and points at `./change-password.sh`.
+  The only case that still prints a password is `--generate-password`, where it
+  is shown exactly once; a re-run that reuses the stored value no longer
+  reprints it.
+- The password is no longer reused from the stored file when the operator
+  explicitly asked for a new one; a re-run without a password flag still reuses
+  the stored value, so upgrading never silently invalidates live sessions.
+- `--password` with an empty or missing value is now a clear error instead of
+  silently installing an empty password.
+
+### Security notes
+
+- Passwords are never written to shell history (entry uses `read -s`) and never
+  echoed in installer output or in the `journalctl` unit log.
+- `change-password.sh` writes the new value through a shell redirect rather than
+  a command line, so it cannot appear in `ps` output while the file is
+  rewritten, and it truncates the file in place to avoid a window in which the
+  password sits in a world-readable file.
+- Verified against systemd 255 that `EnvironmentFile` preserves spaces, `#` and
+  quotes, but consumes a backslash as an escape and trims leading/trailing
+  whitespace. Both scripts warn when a password contains those, since it would
+  be stored but not received exactly as typed.
+
+### Verified
+
+- 43 unit checks over the password helpers (generation, blocklist, strength
+  warnings, and the full prompt loop: match, mismatch retry, give-up after 3
+  attempts, empty → generate, short password confirmation).
+- 25 checks driving both scripts on a **real pseudo-terminal**, confirming the
+  typed password never appears on screen and that the TTY branch is taken.
+- Non-interactive paths: `--password` (accepted verbatim), `--generate-password`,
+  blocklisted values rejected with exit 1, and piped stdin producing no prompt
+  and no change to the stored password.
+- Rollback: with `ExecStart` deliberately broken, the change fails, the previous
+  password is restored, the script exits 1, and the message reports honestly
+  that the service did **not** come back.
+- Full installer runs end to end for all four password modes, each exit 0, with
+  the env file `0600` and its directory `0700`.
+
 ## [0.1.2] — 2026-10-05
 
 Fixes an installation failure on fresh Ubuntu servers. Reproduced and verified

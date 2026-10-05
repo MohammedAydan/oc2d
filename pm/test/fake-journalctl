@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# journalctl stand-in for pm's local test suite. Serves the per-unit log the fake
+# systemctl writes, so pm_logs has real content to return.
+set -uo pipefail
+
+RUNDIR="${PM_TEST_RUNDIR:?}"
+unit=""
+prev=""
+for a in "$@"; do
+	[ "$prev" = "-u" ] && unit="$a"
+	prev="$a"
+done
+
+log="$RUNDIR/${unit}.log"
+if [ -f "$log" ] && [ -s "$log" ]; then
+	cat "$log"
+else
+	echo "-- No entries --"
+fi

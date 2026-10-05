@@ -1,0 +1,11 @@
+{
+  "name": "pm-daemon",
+  "version": "0.1.0",
+  "private": true,
+  "description": "pm project manager daemon",
+  "main": "index.js",
+  "bin": { "pmd": "index.js" },
+  "engines": { "node": ">=18" },
+  "dependencies": {},
+  "scripts": { "start": "node index.js" }
+}

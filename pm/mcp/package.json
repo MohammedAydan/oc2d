@@ -1,0 +1,12 @@
+{
+  "name": "pm-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "description": "pm MCP server (stdio) for OpenCode2",
+  "main": "index.js",
+  "type": "commonjs",
+  "engines": { "node": ">=18" },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0"
+  }
+}

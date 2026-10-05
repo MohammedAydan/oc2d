@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# systemctl stand-in for pm's local test suite. Understands exactly the verbs
+# pm's daemon uses, and really starts/stops the unit's ExecStart so the daemon's
+# port-wait step is exercised for real.
+set -uo pipefail
+
+UNITS_DIR="${PM_UNITS_DIR:?}"
+RUNDIR="${PM_TEST_RUNDIR:?}"
+mkdir -p "$RUNDIR"
+
+cmd="${1:-}"; shift || true
+unit="${1:-}"
+for a in "$@"; do unit="$a"; done
+
+[ "${unit%.service}" = "$unit" ] && exit 0        # daemon-reload and friends
+file="$UNITS_DIR/$unit"
+pidfile="$RUNDIR/$unit.pid"
+
+start_unit() {
+	[ -f "$file" ] || return 1
+	# A sentinel file, not an env var: the daemon is already running, so a later
+	# export in the harness would never reach this child.
+	[ -f "$RUNDIR/fail-systemctl" ] && return 1
+	local port dir
+	port="$(grep -oE 'http\.server [0-9]+' "$file" | awk '{print $2}')"
+	dir="$(grep -oE '\-\-directory [^ ]+' "$file" | awk '{print $2}')"
+	[ -n "$port" ] || return 1
+	python3 -m http.server "$port" --bind 127.0.0.1 --directory "$dir" \
+		>>"$RUNDIR/$unit.log" 2>&1 &
+	echo $! > "$pidfile"
+	# Real systemd reports success only once the unit is up; the daemon then
+	# probes the port, so wait for the listener to actually bind.
+	local i
+	for i in $(seq 1 40); do
+		if curl -fsS -o /dev/null --max-time 1 "http://127.0.0.1:$port/" 2>/dev/null; then return 0; fi
+		sleep 0.1
+	done
+	stop_unit
+	return 1
+}
+
+stop_unit() {
+	if [ -f "$pidfile" ]; then
+		kill "$(cat "$pidfile")" 2>/dev/null
+		wait "$(cat "$pidfile")" 2>/dev/null
+		rm -f "$pidfile"
+	fi
+	return 0
+}
+
+alive() { [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null; }
+
+case "$cmd" in
+	is-active)  alive && exit 0 || exit 3 ;;
+	enable)     start_unit ;;
+	start)      stop_unit; start_unit ;;
+	stop)       stop_unit ;;
+	restart)    stop_unit; start_unit ;;
+	disable)    stop_unit ;;
+	*)          exit 0 ;;
+esac

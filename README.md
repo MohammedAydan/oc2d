@@ -129,6 +129,46 @@ left enabled; remove it with `sudo loginctl disable-linger "$USER"`. `--purge`
 keeps `~/.config/opencode` (your projects and history); delete it by hand to
 erase everything.
 
+## Verification and on-demand TLS
+
+The installer ends with an explicit tally:
+
+```
+[OK]   N checks passed
+[WARN] M checks warn (see above)
+[FAIL] K checks failed (fatal)
+```
+
+Only **fatal** failures abort the install (exit 1). Fatal checks are: the OpenCode
+unit being active, the backend answering on loopback, Caddy active, both units
+enabled at boot, linger enabled, and the backend not being publicly bound.
+
+**HTTPS and certificate checks are non-fatal on purpose.** With on-demand TLS
+Caddy issues a certificate lazily, on the first request, so the certificate is
+routinely absent seconds after install. The installer nudges the ACME HTTP-01
+challenge with a `:80` request and then retries HTTPS for up to ~120 seconds
+(24 attempts, 5s apart), reporting `[wait] HTTPS not ready yet (attempt N/24)...`.
+If it still isn't ready, that is reported as a warning with a follow-up command
+rather than a failed install:
+
+```bash
+curl -I https://example.com/
+journalctl -u caddy -f
+```
+
+If the warning persists well past two minutes, the cause is usually **not** timing
+— it is an authorization policy. On a host whose Caddy uses `on_demand_tls` with
+an `ask` endpoint, a name the gate does not approve will never receive a
+certificate, no matter how long you wait. Confirm with:
+
+```bash
+grep -A3 'on_demand_tls' /etc/caddy/Caddyfile   # find the ask endpoint
+curl -s -o /dev/null -w '%{http_code}\n' -H "Host: example.com" http://127.0.0.1:8000/internal/check-domain
+```
+
+Reboot resilience is judged on the backend's loopback health, never on HTTPS, so a
+pending certificate can never be mistaken for a reboot failure.
+
 ## Troubleshooting
 
 ```bash

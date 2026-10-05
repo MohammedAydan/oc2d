@@ -2,6 +2,47 @@
 
 All notable changes to this project are documented here.
 
+## [0.1.1] — 2026-10-05
+
+Fixes a verification timing bug found on a host with a pre-existing on-demand
+TLS wildcard (`*.example.com` with an `ask` policy).
+
+### Fixed
+
+- **HTTPS verification no longer races certificate provisioning.** On-demand TLS
+  issues a certificate lazily, on the first request, so a single-shot probe could
+  report a healthy stack as broken. `wait_https` now nudges the ACME HTTP-01
+  challenge with a `:80` request and retries up to 24 times at 5s intervals
+  (~120s), printing `[wait] HTTPS not ready yet (attempt N/24)...` each time. A
+  5xx is reported from attempt 3 onward without aborting.
+- **Certificate read retries too.** `wait_cert` polls for up to the same budget,
+  so a lazily-issued certificate is no longer reported as missing.
+- **HTTPS and certificate checks are now non-fatal.** They warn, print a
+  follow-up command, and let the install succeed. Installation logic is unchanged.
+- **Final failure classifies the cause** as `DNS`, `TCP`, `TLS` or an HTTP status,
+  derived from curl's own error text, instead of a bare "unreachable".
+- **Reboot resilience no longer depends on HTTPS.** The backend check on
+  `127.0.0.1:$PORT` is the source of truth; the post-restart HTTPS probe is a
+  single fast, non-fatal observation. This also removed a redundant second
+  120-second retry loop.
+- **Explicit pass/warn/fail tally.** The run ends with
+  `[OK] N checks passed`, `[WARN] M checks warn`, `[FAIL] K checks failed
+  (fatal)`. Only fatal failures abort.
+- **Pre-existing site checks retry** (6 × 5s), so a lazily-provisioned on-demand
+  certificate on someone else's site is not mistaken for damage we caused.
+- **Harmless Caddy `Unnecessary header_up` warnings** from pre-existing site
+  blocks are surfaced as a note and deliberately left untouched.
+
+### Fatal vs non-fatal
+
+Fatal (abort, exit 1): OpenCode unit not active; backend not answering on
+loopback; Caddy not active; either unit not enabled; linger missing; backend
+publicly bound; crash recovery failed; a pre-existing site down.
+
+Non-fatal (warn, exit 0): HTTPS not yet ready; certificate not yet issued;
+issuer not a recognised public CA; external reachability; HTTPS still
+provisioning after restart.
+
 ## [0.1.0] — 2026-10-05
 
 Initial production release. Installs OpenCode 2 behind a Caddy reverse proxy

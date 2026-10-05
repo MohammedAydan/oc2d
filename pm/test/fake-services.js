@@ -34,11 +34,35 @@ http.createServer(async (req, res) => {
     return json(res, 200, { srv0: { listen: [':443'], routes } });
   }
   if (u.pathname.endsWith('/routes')) {
-    if (req.method === 'GET') return json(res, 200, routes);
+    if (req.method === 'GET') return json(res, routes.length ? 200 : 404, routes);
+    // Real Caddy 2.11 semantics, learned from live 409/500 responses. A fake that
+    // accepted anything would hide exactly the bug these guard:
+    //   PUT  <array>     -> 409 "key already exists: routes"
+    //   POST <array>     -> 500 "cannot unmarshal array into … caddyhttp.Route"
+    //   POST <object>    -> 500 "cannot unmarshal object into … RouteList"
+    //   DELETE + POST <array> -> replaces the list, preserving our order
     if (req.method === 'PUT') {
-      const next = (await body()) || [];
+      return json(res, 409, { error: '[/config/apps/http/servers/srv0/routes] key already exists: routes' });
+    }
+    if (req.method === 'DELETE') {
       routes.length = 0;
-      routes.push(...next);
+      return json(res, 200, {});
+    }
+    if (req.method === 'POST') {
+      const next = await body();
+      if (Array.isArray(next)) {
+        // Real Caddy only accepts an array where no `routes` key exists yet, which
+        // is why pm DELETEs the list before POSTing. A fake that accepted this
+        // unconditionally would mask the bug that broke the live install.
+        if (routes.length) {
+          return json(res, 500, { error: 'decoding module config: http: json: cannot unmarshal array into Go struct field Server.servers.routes of type caddyhttp.Route' });
+        }
+        routes.push(...next);
+      } else if (next && typeof next === 'object') {
+        routes.push(next); // single-route append is legal when the list exists
+      } else {
+        return json(res, 500, { error: 'decoding module config: http: json: cannot unmarshal array into Go struct field Server.servers.routes of type caddyhttp.Route' });
+      }
       console.error('[fake-caddy] routes now: ' +
         JSON.stringify(routes.map((r) => (r.match && r.match[0] && r.match[0].host) || r.handle[0].handler)));
       return json(res, 200, {});

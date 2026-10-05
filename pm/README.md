@@ -196,6 +196,17 @@ by the regression case in `test/caddy-config-test.sh`.
 
 **Ordering matters for Caddy routes.** `pmd` writes exact-host routes *before*
 the wildcard block so they win the match, and keeps every route it does not own.
+Replacing that list takes `DELETE` then `POST`: against Caddy 2.11 a `PUT` to the
+routes array answers 409 `key already exists`, and a `POST` of an array into an
+existing list answers 500. `test/fake-services.js` reproduces all three
+responses so the suite cannot pass on a fake again.
+
+**Re-running the installer restarts `pmd`.** `systemctl enable --now` does
+nothing when the unit is already active, which would leave the old process
+running with a stale `Environment=` — the failure mode that once emptied
+`PM_FALLBACK_ASKS` and broke oc2d's certificates. The installer now always
+restarts, and recovers the previous fallback gate from the running unit when the
+Caddyfile no longer names one.
 
 ## License
 

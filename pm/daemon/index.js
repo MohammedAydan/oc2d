@@ -9,6 +9,7 @@ const path = require('path');
 const net = require('net');
 const crypto = require('crypto');
 const { spawnSync } = require('child_process');
+const https = require('https');
 
 const CFG = {
   tokenFile: process.env.PM_TOKEN_FILE || '/etc/pm/token',
@@ -28,6 +29,16 @@ const [PORT_LO, PORT_HI] = (process.env.PM_PORT_RANGE || '4096-5000').split('-')
 
 const NAME_RE = /^[a-z][a-z0-9-]{1,30}$/;
 const UNIT = (n) => `pm-${n}.service`;
+// pmd is root; projects are not. Resolve the uid:gid once so scaffold() can hand
+// the tree to the user the unit actually runs as.
+CFG.runUserIds = (() => {
+  const u = run('id', ['-u', CFG.runUser]).out;
+  if (!/^\d+$/.test(u)) {
+    console.error(`pmd: user "${CFG.runUser}" does not exist; projects will not be chowned`);
+    return null;
+  }
+  return `${u}:${run('id', ['-g', CFG.runUser]).out}`;
+})();
 
 // ---------------------------------------------------------------- utilities
 
@@ -99,9 +110,13 @@ function waitFor(fn, timeoutMs, stepMs = 250) {
   });
 }
 
+// Pick the client from the scheme: `http.get` cannot speak TLS, so probing an
+// https:// URL with it fails on every attempt and the project is reported as
+// "not reachable over HTTPS" even while it is serving perfectly.
 const httpProbe = (url, accept) =>
   new Promise((resolve) => {
-    const req = http.get(url, { timeout: 5000 }, (res) => { res.resume(); resolve(accept(res.statusCode)); });
+    const client = url.startsWith('https:') ? https : http;
+    const req = client.get(url, { timeout: 5000 }, (res) => { res.resume(); resolve(accept(res.statusCode)); });
     req.on('error', () => resolve(false));
     req.on('timeout', () => { req.destroy(); resolve(false); });
   });
@@ -163,9 +178,14 @@ async function caddySync(droppedSubdomains = []) {
     terminal: true,
   }));
 
-  // Exact-host routes first: the Caddyfile's wildcard block is kept in `keep`,
-  // and Caddy evaluates routes in order (also sorting by matcher specificity).
-  await caddy('PUT', base, [...ours, ...keep]);
+  // Replace the array in two steps. Verified against Caddy 2.11:
+  //   PUT  <array>  -> 409 "key already exists: routes"
+  //   POST <array>  -> 500 "cannot unmarshal array into … caddyhttp.Route"
+  // DELETE + POST <array> is the only combination that both works and puts our
+  // routes first, which matters: the Caddyfile's `*.<parent>` block is kept in
+  // `keep`, and a wildcard host matcher would otherwise shadow every exact host.
+  await caddy('DELETE', base);
+  await caddy('POST', base, [...ours, ...keep]);
   return ours.length;
 }
 
@@ -177,6 +197,9 @@ async function caddySyncQuiet(drop) {
 
 function scaffold(dir, name, port) {
   fs.mkdirSync(dir, { recursive: true, mode: 0o750 });
+  // pmd runs as root but the unit runs as CFG.runUser, so the tree must be
+  // owned by that user or it lands root-owned and the unit cannot chdir into it
+  // (systemd: "Changing to the requested working directory failed").
   fs.writeFileSync(path.join(dir, 'index.html'),
 `<!doctype html>
 <html lang="en">
@@ -205,6 +228,11 @@ NoNewPrivileges=true
 [Install]
 WantedBy=multi-user.target
 `);
+
+  if (CFG.runUserIds) {
+    const c = run('chown', ['-R', CFG.runUserIds, dir]);
+    if (c.code !== 0) throw new Error(`chown ${dir} to ${CFG.runUser} failed: ${c.err}`);
+  }
 }
 
 const unitActive = (name) => run('systemctl', ['is-active', '--quiet', UNIT(name)]).code === 0;

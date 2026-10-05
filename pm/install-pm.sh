@@ -86,7 +86,15 @@ fi
 
 # ------------------------------------------------------------------ 3. user
 say "Creating service user and directories"
-id -u pm >/dev/null 2>&1 || useradd --system --home-dir /srv/pm --shell /usr/sbin/nologin pm
+if id -u pm >/dev/null 2>&1; then
+	say "User pm already exists"
+else
+	useradd --system --home-dir /srv/pm --shell /usr/sbin/nologin pm
+fi
+# useradd does NOT chown --home-dir, so /srv/pm stays root:root. Projects live
+# under it and their units run as pm, which would fail to chdir into them.
+chown pm:pm /srv/pm
+chmod 0755 /srv/pm
 install -d -o pm -g pm -m 0750 /srv/pm/projects
 install -d -m 0755 /opt/pm/daemon /opt/pm/mcp
 install -d -o pm -g pm -m 0750 /var/lib/pm
@@ -145,6 +153,19 @@ else
 	ok "added global on_demand_tls block"
 fi
 
+# Re-running must not forget an upstream gate. After the first install the only
+# `ask` left in the Caddyfile is pm's own, so the fallback would be lost and
+# pre-existing sites would start failing their TLS handshake. Recover it from
+# the running unit when the Caddyfile no longer names one.
+if [ -z "$OLD_ASKS" ] && systemctl is-active --quiet "$UNIT_NAME"; then
+	PREV="$(systemctl show "$UNIT_NAME" -p Environment --value 2>/dev/null |
+		sed -n 's/.*PM_FALLBACK_ASKS=\([^ ]*\).*/\1/p')"
+	if [ -n "$PREV" ]; then
+		OLD_ASKS="$PREV"
+		say "recovered previous fallback gate(s): $OLD_ASKS"
+	fi
+fi
+
 # The wildcard site block. Real upstreams are injected through Caddy's admin API
 # per project; this block only serves the TLS policy and a sane 404 fallback.
 if grep -q "$PREFIX" "$CADDYFILE"; then
@@ -192,8 +213,13 @@ Environment="PM_FALLBACK_ASKS=$OLD_ASKS"
 WantedBy=multi-user.target
 UNIT
 systemctl daemon-reload
-systemctl enable --now "$UNIT_NAME" >/dev/null
-ok "unit enabled and started"
+systemctl enable "$UNIT_NAME" >/dev/null
+# `enable --now` is a NO-OP when the unit is already active, so a re-install
+# would keep the old process and silently ignore a changed Environment= (which
+# is how PM_FALLBACK_ASKS went stale and broke oc2d's TLS delegation).
+# Always restart so the unit file just written is the one actually running.
+systemctl restart "$UNIT_NAME"
+ok "unit enabled and (re)started"
 
 say "Waiting for the daemon to answer /health"
 healthy=0

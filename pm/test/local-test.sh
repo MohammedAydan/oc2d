@@ -58,7 +58,10 @@ export PM_TEST_RUNDIR="$WORK/run" PM_READY_TIMEOUT_MS=10000 PM_HTTPS_TIMEOUT_MS=
 
 node "$HERE/fake-services.js" >"$WORK/logs/fakes.log" 2>&1 &
 FAKES=$!
-node "$PM/daemon/index.js" >"$WORK/logs/pmd.log" 2>&1 &
+# The shim gives *.pmtest.example.com a loopback address and a real TLS endpoint,
+# so the daemon's https:// readiness probe exercises a genuine TLS request.
+NODE_OPTIONS="--require $HERE/fake-dns-tls.js" \
+	node "$PM/daemon/index.js" >"$WORK/logs/pmd.log" 2>&1 &
 PMD=$!
 trap 'cleanup_pid $PMD; cleanup_pid $FAKES' EXIT
 
@@ -100,10 +103,19 @@ BLOG_PORT="$(jqf 1 .port)"
 assert_ne "a port was assigned from the range" "" "$BLOG_PORT"
 case "$BLOG_PORT" in 4[56]??) pass "port $BLOG_PORT is inside PM_PORT_RANGE";; *) fail "port inside range" "got $BLOG_PORT";; esac
 assert_eq "status is running" running "$(jqf 1 .status)"
+# The point of the fake TLS endpoint: this must be TRUE, not merely present.
+# A plain http.get against an https:// URL fails forever, so this is the
+# assertion that catches a broken readiness probe.
+assert_eq "httpsReady is true (real TLS request succeeded)" true "$(jqf 1 .httpsReady)"
+assert_eq "https URL is reported back" "https://blog.$PARENT" "$(jqf 1 .https)"
 assert_eq "unit file was written" "pm-blog.service" "$(ls "$WORK/units")"
 assert_has "unit runs as an unprivileged user" "User=$(id -un)" "$(cat "$WORK/units/pm-blog.service")"
 assert_has "unit is bound to loopback only" 'bind 127.0.0.1' "$(cat "$WORK/units/pm-blog.service")"
 assert_eq "project dir was scaffolded" "index.html" "$(ls "$WORK/projects/blog")"
+# pmd runs as root here (User= in the unit is the harness user), so without an
+# explicit chown the tree would be root-owned and the unit could not read it.
+assert_eq "project dir is owned by the unit's run user" "$(id -u)" \
+	"$(stat -c '%u' "$WORK/projects/blog")"
 assert_eq "the port really serves" "200" \
 	"$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$BLOG_PORT/")"
 assert_eq "it is persisted in state.json" "blog" "$(jq -r '.projects[0].name' "$WORK/state/state.json")"

@@ -2,6 +2,55 @@
 
 All notable changes to this project are documented here.
 
+## [0.1.2] — 2026-10-05
+
+Fixes an installation failure on fresh Ubuntu servers. Reproduced and verified
+against a pristine Ubuntu 24.04 rootfs (empty `/var/lib/apt/lists`, `curl`,
+`debian-keyring` and `apt-transport-https` absent), not a host where Caddy was
+already present.
+
+### Fixed
+
+- **`apt-get update` now runs before any `apt-get install`.** This was the
+  blocking bug. On a fresh server the package lists are empty, so
+  `apt-get install -y curl` fails with `E: Unable to locate package curl`
+  (exit **100**). The update is still skipped when nothing is missing.
+- **Wrong exit code in error messages.** `rc=$?` was read *inside* an `if ! cmd`
+  block, where `$?` reflects the negation and is therefore always `0`. Every
+  failure was reported as `command failed (exit 0)`. The code is now captured as
+  `cmd || rc=$?`, which yields the real status (verified: exit 7 and exit 100
+  both reported correctly).
+- **Temp file path leaked to output.** `root_or_die` printed the *path* returned
+  by `mktemp` instead of the captured output, so every failure began with a bare
+  `/tmp/tmp.XXXXXXXX`. It now prints the command's real output.
+- **Real error context.** Failures show a `--- output of: sudo … ---` banner and
+  the last 20 lines of the command's own output, which is where the actual apt
+  error lives.
+- **Temp files registered for cleanup.** `root_or_die`'s capture file was never
+  added to `TMPDIRS`, so it leaked on every call, including failures.
+- **Prerequisites are checked before installing.** `missing_packages` uses
+  `dpkg-query -f='${db:Status-Status}'` to test each of `debian-keyring`,
+  `debian-archive-keyring`, `apt-transport-https` and `curl`, and the script
+  installs only what is actually absent.
+- **Caddy install is idempotent.** An installed, running Caddy skips the entire
+  apt block. `--upgrade` now upgrades Caddy via `apt-get install --only-upgrade`
+  instead of being a silent no-op for the proxy.
+
+### Verified
+
+- Old `v0.1.1` code on a pristine Ubuntu 24.04 rootfs reproduces the report
+  exactly: a leaked `/tmp/tmp.*` path followed by
+  `error command failed (exit 0): sudo apt-get install -y debian-keyring …`.
+- Fixed code on the same pristine rootfs completes with exit 0 and installs
+  Caddy v2.11.7, with `apt-get update` visibly preceding the prerequisite
+  install.
+- Package check returns empty on a host where all four are present, so no
+  `apt-get` call is made on re-run.
+- Two consecutive full runs leave zero `/tmp/tmp.*` behind and print no temp
+  paths.
+- Full stack still green on the production host: 14 passed / 0 warn / 0 failed,
+  HTTPS 200.
+
 ## [0.1.1] — 2026-10-05 (final)
 
 Fixes a verification timing bug found on a host with a pre-existing on-demand

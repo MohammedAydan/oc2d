@@ -264,19 +264,35 @@ install_opencode() {
 }
 
 # --- caddy ---
-# Run a root command and, on failure, abort with the exact command and its real
-# output. Guessing at the cause of an apt failure wastes the operator's time.
+# Run a root command and, on failure, abort with the exact command, its REAL exit
+# code and its output.
+#
+# The exit code must be captured as `cmd || rc=$?`. Reading $? inside an
+# `if ! cmd` block reports the *negation*, which is always 0, so a genuine
+# failure would be misreported as "exit 0".
 root_or_die() {
-  local out rc
+  local out rc=0
   out="$(mktemp)"
-  if ! as_root "$@" >"$out" 2>&1; then
-    rc=$?
-    printf '%s\n' "${out}" >&2
+  TMPDIRS+=("$out")           # register so the EXIT trap cleans it up
+  as_root "$@" >"$out" 2>&1 || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    printf '%s--- output of: sudo %s ---%s\n' "$Y" "$*" "$N" >&2
+    tail -n 20 "$out" >&2     # the real apt error, not a temp path
     rm -f "$out"
     die "command failed (exit $rc): sudo $*"
   fi
   cat "$out"
   rm -f "$out"
+}
+
+# Echo any of the given packages that are not currently installed, one per line.
+missing_packages() {
+  local pkg
+  for pkg in "$@"; do
+    dpkg-query -W -f='${db:Status-Status}' "$pkg" 2>/dev/null | grep -qx installed \
+      || printf '%s\n' "$pkg"
+  done
+  return 0
 }
 
 # Installed and running -> reuse. Installed but stopped -> start and enable.
@@ -285,7 +301,12 @@ install_caddy() {
   step "Pre-flight: Caddy"
   if command -v caddy >/dev/null 2>&1; then
     ok "Caddy already installed: $(caddy version 2>/dev/null | head -1)"
-    if as_root systemctl is-active --quiet caddy; then
+    if [ "$UPGRADE" -eq 1 ]; then
+      step "Upgrading Caddy (--upgrade)"
+      root_or_die apt-get update -qq >/dev/null
+      root_or_die apt-get install -y --only-upgrade caddy >/dev/null
+      ok "upgraded: $(caddy version 2>/dev/null | head -1)"
+    elif as_root systemctl is-active --quiet caddy; then
       ok "Caddy is running; reusing it (not reinstalling)"
     else
       warn "Caddy is installed but not running; starting and enabling it"
@@ -298,12 +319,28 @@ install_caddy() {
   fi
 
   step "Installing Caddy from the official repository"
-  root_or_die apt-get install -y debian-keyring debian-archive-keyring apt-transport-https curl \
-    >/dev/null
+
+  # On a fresh server the package lists are empty or stale, so apt-get install
+  # fails outright. Update first, but only when something is actually missing.
+  # Word splitting is intended here: this is a package list for apt-get.
+  local missing_pkgs=()
+  mapfile -t missing_pkgs < <(missing_packages debian-keyring debian-archive-keyring apt-transport-https curl)
+  if [ "${#missing_pkgs[@]}" -gt 0 ]; then
+    step "Updating apt package lists (fresh images ship without them)"
+    root_or_die apt-get update -qq >/dev/null
+    step "Installing Caddy apt prerequisites: ${missing_pkgs[*]}"
+    root_or_die apt-get install -y "${missing_pkgs[@]}" >/dev/null
+  else
+    ok "Caddy apt prerequisites already installed; skipping apt-get update"
+  fi
+
   curl -1sLf "$CADDY_REPO_URL/gpg.key" | as_root gpg --dearmor -o "$CADDY_KEYRING" \
     || die "could not import the Caddy signing key from $CADDY_REPO_URL/gpg.key"
   curl -1sLf "$CADDY_REPO_URL/debian.deb.txt" | as_root tee "$CADDY_REPO_LIST" >/dev/null \
     || die "could not add the Caddy apt repository from $CADDY_REPO_URL/debian.deb.txt"
+
+  # The new repository needs its own update before caddy becomes visible.
+  step "Refreshing apt lists for the Caddy repository"
   root_or_die apt-get update -qq >/dev/null
   root_or_die apt-get install -y caddy >/dev/null
   command -v caddy >/dev/null 2>&1 || die "apt-get install caddy reported success but no caddy binary is on PATH"

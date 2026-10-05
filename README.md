@@ -129,7 +129,7 @@ left enabled; remove it with `sudo loginctl disable-linger "$USER"`. `--purge`
 keeps `~/.config/opencode` (your projects and history); delete it by hand to
 erase everything.
 
-## Verification and on-demand TLS
+## Verification
 
 The installer ends with an explicit tally:
 
@@ -143,31 +143,154 @@ Only **fatal** failures abort the install (exit 1). Fatal checks are: the OpenCo
 unit being active, the backend answering on loopback, Caddy active, both units
 enabled at boot, linger enabled, and the backend not being publicly bound.
 
+Non-fatal (warn, exit 0): HTTPS not yet ready, certificate not yet issued,
+certificate issuer not recognised, external reachability, and HTTPS still
+provisioning after a restart.
+
 **HTTPS and certificate checks are non-fatal on purpose.** With on-demand TLS
 Caddy issues a certificate lazily, on the first request, so the certificate is
 routinely absent seconds after install. The installer nudges the ACME HTTP-01
 challenge with a `:80` request and then retries HTTPS for up to ~120 seconds
 (24 attempts, 5s apart), reporting `[wait] HTTPS not ready yet (attempt N/24)...`.
-If it still isn't ready, that is reported as a warning with a follow-up command
-rather than a failed install:
-
-```bash
-curl -I https://example.com/
-journalctl -u caddy -f
-```
-
-If the warning persists well past two minutes, the cause is usually **not** timing
-— it is an authorization policy. On a host whose Caddy uses `on_demand_tls` with
-an `ask` endpoint, a name the gate does not approve will never receive a
-certificate, no matter how long you wait. Confirm with:
-
-```bash
-grep -A3 'on_demand_tls' /etc/caddy/Caddyfile   # find the ask endpoint
-curl -s -o /dev/null -w '%{http_code}\n' -H "Host: example.com" http://127.0.0.1:8000/internal/check-domain
-```
 
 Reboot resilience is judged on the backend's loopback health, never on HTTPS, so a
 pending certificate can never be mistaken for a reboot failure.
+
+## When the Domain Uses On-Demand TLS
+
+If your host's Caddy already serves a wildcard block with on-demand TLS, you need
+to understand one external dependency before running the installer.
+
+**What on-demand TLS is.** Normally Caddy issues a certificate for every name it
+is configured to serve, at startup. With `tls { on_demand }`, Caddy issues a
+certificate **only when a name is first requested**, and only if an authorization
+endpoint approves it. A typical host config looks like this:
+
+```caddyfile
+{
+    on_demand_tls {
+        ask http://127.0.0.1:8000/internal/check-domain
+    }
+}
+
+*.example.com {
+    tls { on_demand }
+    reverse_proxy 127.0.0.1:8000
+}
+```
+
+The `ask` endpoint is a gate owned by **whatever application backs that control
+plane** — not by `oc2d`.
+
+**What the installer does about it.** It detects the wildcard and `on_demand`
+policy, and emits a matching `tls { on_demand }` block for your domain so the two
+agree on how TLS is obtained. Without this, overlapping blocks disagree and the
+handshake fails with `tlsv1 alert internal error`. The installer **never modifies
+the wildcard block or the `ask` endpoint.**
+
+**What the installer cannot do.** It cannot register your subdomain in that
+control plane. If the gate does not approve the name, **no certificate will ever
+be issued for it, no matter how long anyone waits.** This is an authorization
+decision in another system, and it is **not an `oc2d` responsibility or bug**.
+
+### Check whether your subdomain is registered
+
+Run this **before** installing:
+
+```bash
+curl -H "Host: code.example.com" http://127.0.0.1:8000/internal/check-domain
+```
+
+| Response | Meaning |
+|---|---|
+| `200` | Registered — the installer can obtain a certificate for it. |
+| `404` | **Not registered.** Caddy will refuse to issue, forever. |
+| `403` | Registered but explicitly denied. |
+| `422` | The name is not a valid subdomain for this gate. |
+| Connection refused | The control plane is down, or there is no `ask` gate here. |
+
+A `404` from this endpoint is the single most useful thing to check when HTTPS
+does not come up. It is authoritative: no amount of retrying will change it.
+
+To find the real gate on your host:
+
+```bash
+grep -A3 'on_demand_tls' /etc/caddy/Caddyfile
+```
+
+### If the gate returns 404
+
+Three options, in order of preference:
+
+**Option A — Register the subdomain in the control plane.** Ask whoever owns the
+application on `127.0.0.1:8000` to register the name, then re-run the
+installer. This keeps one wildcard and one certificate strategy.
+
+**Option B — Use a subdomain that is already registered.** If one exists, use it:
+
+```bash
+./install-opencode.sh --domain already-registered.example.com
+```
+
+**Option C — Serve a separate domain directly, outside the on-demand gate.** Add
+its own explicit block so Caddy uses ordinary automatic HTTPS for it. Only do this
+if you own the DNS for that domain, and note it must not overlap the wildcard:
+
+```caddyfile
+other.example.net {
+    reverse_proxy 127.0.0.1:4096
+}
+```
+
+After registering, re-run the installer — it merges, does not duplicate, and will
+confirm HTTPS within its retry window.
+
+### Worked example from testing
+
+On the host this project was validated against, `opencode.r.example` returned `200`
+from the gate and serves HTTPS with a valid Let's Encrypt certificate, while
+`opencode2.r.example` returned `404` and could never obtain one. Both installs
+completed with **exit 0**: the first with all checks passing, the second with the
+certificate checks correctly reported as warnings. The installer was correct in
+both cases; only the second name lacked external authorization.
+
+## Diagnostics
+
+```bash
+DOMAIN=code.example.com
+
+# Watch Caddy provision certificates (the message you want is
+# "certificate obtained successfully" or "enabling automatic TLS certificate management")
+journalctl -u caddy -f
+
+# Watch the OpenCode server itself
+journalctl --user -u opencode.service -f
+
+# Verify the HTTP -> HTTPS redirect (expect 308/301 to https://)
+curl -v http://$DOMAIN/
+
+# Verify the TLS handshake and the served content
+curl -v https://$DOMAIN/
+
+# Certificate validity dates
+echo | openssl s_client -connect $DOMAIN:443 -servername $DOMAIN 2>/dev/null \
+  | openssl x509 -noout -dates
+
+# Is the domain authorized for on-demand TLS? (see above)
+curl -H "Host: $DOMAIN" http://127.0.0.1:8000/internal/check-domain
+
+# Which names does Caddy think it manages?
+sudo journalctl -u caddy --since '-10 min' --no-pager | grep 'automatic TLS certificate management'
+```
+
+Interpreting the common outcomes:
+
+| Symptom | Likely cause |
+|---|---|
+| `tlsv1 alert internal error` | `ask` gate denied the name (404/403), or a block needs `tls { on_demand }` |
+| `502` from Caddy | OpenCode backend is down — check `systemctl --user status opencode.service` |
+| `308` to HTTPS on port 80 | Correct; the redirect is working |
+| `Cannot complete TLS handshake` | Certificate still provisioning, or no certificate issued |
 
 ## Troubleshooting
 

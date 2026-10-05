@@ -38,6 +38,7 @@ RUN_USER="$(id -un)"
 PUBLIC_IP=""
 BIN=""
 TMPDIR_SELF=""
+TMPDIRS=()            # every temp dir created, so the trap can remove all of them
 PRISTINE_SITES=""      # pre-existing Caddy hostnames, for the production-safety audit
 
 # --- output ---
@@ -49,8 +50,21 @@ warn() { printf '%swarn%s %s\n' "$Y" "$N" "$*" >&2; }
 die()  { printf '%serror%s %s\n' "$R" "$N" "$*" >&2; exit 1; }
 
 # Last statement must succeed: a failing EXIT trap replaces the script's status.
-cleanup() { [ -n "$TMPDIR_SELF" ] && rm -rf "$TMPDIR_SELF"; return 0; }
+# TMPDIR_SELF is reassigned by several steps, so remove every registered dir.
+cleanup() {
+  local d
+  for d in "${TMPDIRS[@]:-}"; do [ -n "$d" ] && rm -rf "$d"; done
+  return 0
+}
 trap cleanup EXIT
+
+# Registering each dir (rather than overwriting one variable) is what guarantees
+# no temp dir survives a partial run.
+mktmp() {
+  TMPDIR_SELF="$(mktemp -d)"
+  TMPDIRS+=("$TMPDIR_SELF")
+  printf '%s' "$TMPDIR_SELF"
+}
 
 usage() {
   cat <<EOF
@@ -234,7 +248,7 @@ install_opencode() {
   fi
 
   if [ "$need_install" -eq 1 ]; then
-    TMPDIR_SELF="$(mktemp -d)"
+    mktmp >/dev/null
     step "Downloading OpenCode 2 from ${INSTALL_URL}"
     curl -fsSL --max-time 120 "$INSTALL_URL" -o "${TMPDIR_SELF}/install.sh" \
       || die "could not download the V2 installer from $INSTALL_URL"
@@ -312,7 +326,7 @@ generate_caddyfile() {
   step "Configuring Caddy for $DOMAIN"
   [ -f "$CADDYFILE" ] || { mkdir -p /etc/caddy; : > "$CADDYFILE"; }
 
-  TMPDIR_SELF="$(mktemp -d)"
+  mktmp >/dev/null
   # Snapshot every pre-existing site hostname so the audit can prove we did not
   # break a neighbour's production site. Recorded BEFORE we touch anything.
   PRISTINE_SITES=""
@@ -345,7 +359,7 @@ generate_caddyfile() {
 
   # Drop any previous block for this domain, then append ours, so re-runs replace
   # rather than duplicate. Other sites in the file are left untouched.
-  TMPDIR_SELF="$(mktemp -d)"
+  mktmp >/dev/null
   strip_block "$CADDYFILE" > "${TMPDIR_SELF}/merged" || true
   printf '\n%s\n' "$block" >> "${TMPDIR_SELF}/merged"
   as_root cp "${TMPDIR_SELF}/merged" "$CADDYFILE" || die "could not write $CADDYFILE"
@@ -669,7 +683,7 @@ uninstall() {
   # Remove our site block, but never leave Caddy with an invalid config: if the
   # result would not validate, put the original back and warn instead.
   if [ -n "$DOMAIN" ] && [ -f "$CADDYFILE" ]; then
-    TMPDIR_SELF="$(mktemp -d)"
+    mktmp >/dev/null
     if strip_block "$CADDYFILE" > "${TMPDIR_SELF}/Caddyfile" && [ -s "${TMPDIR_SELF}/Caddyfile" ]; then
       as_root cp -a "$CADDYFILE" "${CADDYFILE}.bak.$(date +%Y%m%d-%H%M%S)"
       as_root cp "${TMPDIR_SELF}/Caddyfile" "$CADDYFILE"

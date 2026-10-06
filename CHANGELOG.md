@@ -2,6 +2,30 @@
 
 All notable changes to this project are documented here.
 
+## [0.2.2] — 2026-10-06
+
+Fixes two regressions in `0.2.1`: the parent prompt could confirm the wrong answer
+by default, and the installer died creating its service directories.
+
+### Fixed
+
+- **`/srv/pm` was chowned before it existed.** `useradd --home-dir` does not
+  create the directory, so `chown pm:pm /srv/pm` failed with `cannot access
+  '/srv/pm': No such file or directory` and aborted the install. A `mkdir -p
+  /srv/pm` now precedes it.
+- **The parent prompt offered a default the operator never chose.** `--domain`
+  was echoed into the prompt, so pressing Enter accepted a parent that had nothing
+  to do with pm's wildcard. The prompt is now empty and states plainly that the
+  parent is independent of `--domain`.
+- **Pressing Enter could no longer skip pm.** An empty answer warned and
+  re-prompted forever. It is now a decision: pm is optional, so an empty answer
+  prints `Skipping pm install.` and continues with exit 0.
+- **An explicitly named parent that fails its wildcard check now exits 1.** A
+  parent given via `--pm-parent` or typed at the prompt is a request, and silently
+  downgrading it to a skip hides the fact it was not honoured. This is checked
+  before any filesystem change. A parent that pm *detected* on its own still skips
+  quietly, since a guess never became an instruction.
+
 ## [0.2.1] — 2026-10-06
 
 Fixes four bugs in the unified installer, all reported from a fresh host. The

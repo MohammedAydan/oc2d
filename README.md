@@ -92,8 +92,15 @@ guessed:
 1. `--pm-parent`, if given
 2. `PM_PARENT` from an already-running `pmd.service`
 3. a `*.` block already in the Caddyfile whose wildcard resolves to this host
-4. an interactive prompt explaining exactly what it is
+4. an interactive prompt explaining exactly what it is — the prompt is left empty
+   on purpose, since any value pre-filled from `--domain` would be a parent you
+   never chose. **Press Enter to skip pm**; the install still succeeds.
 5. otherwise pm is **skipped** with the records to add — OpenCode still installs
+
+A parent you supply yourself (`--pm-parent`, or typed at the prompt) is a
+*request*, so if its wildcard does not point here the installer stops with exit 1
+and tells you what it resolved to — before touching the filesystem. A parent pm
+merely *detected* is only a guess, so that one skips quietly instead.
 
 A parent needs a wildcard DNS record pointing here:
 

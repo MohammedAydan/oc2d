@@ -180,8 +180,12 @@ if id -u pm >/dev/null 2>&1; then
 else
 	useradd --system --home-dir /srv/pm --shell /usr/sbin/nologin pm
 fi
-# useradd does NOT chown --home-dir, so /srv/pm stays root:root. Projects live
-# under it and their units run as pm, which would fail to chdir into them.
+# useradd does NOT create or chown --home-dir, so /srv/pm does not exist at all.
+# It must be created BEFORE the chown, or chown fails on a missing path and takes
+# the whole install down with it.
+mkdir -p /srv/pm
+# Projects live under it and their units run as pm, which would otherwise fail to
+# chdir into them.
 chown pm:pm /srv/pm
 chmod 0755 /srv/pm
 install -d -o pm -g pm -m 0750 /srv/pm/projects

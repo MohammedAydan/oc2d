@@ -24,10 +24,13 @@ CORS_EXTRA=""
 PW_MODE="auto"        # auto | given | generate; auto prompts only on a TTY
 PW_SOURCE=""          # user | generated | reused — decided once the value is final
 WITH_PM=""            # "" = auto-detect/prompt, "yes" = force, "no" = skip
-PM_PARENT=""          # parent domain pm may expose subdomains under
+PM_PARENT=""          # resolved parent domain pm may expose subdomains under
+PM_PARENT_FLAG=""     # ONLY what --pm-parent supplied, before any detection/prompt
+PM_PARENT_EXPLICIT=0 # 1 = a human named this parent (flag or prompt), 0 = we detected it
 PM_SKIP_SMOKE=0       # pm's own smoke test; the combined one still runs
 PM_INSTALLED=0        # set once pm is known to be present and wired
 PM_SKIPPED=""         # why pm was not installed, when it was not
+PM_FATAL=0            # 1 = pm was explicitly requested but is unusable; exit 1 after the summary
 
 INSTALL_URL="https://opencode.ai/v2/install"      # V2 only; V1 is not wire-compatible
 LATEST_URL="https://opencode.ai/update/api/latest/cli/npm"
@@ -145,7 +148,7 @@ parse_args() {
       --strict-port) STRICT_PORT=1; shift ;;
       --with-pm)  WITH_PM="yes"; shift ;;
       --without-pm) WITH_PM="no"; shift ;;
-      --pm-parent) PM_PARENT="${2:-}"; shift 2 ;;
+      --pm-parent) PM_PARENT_FLAG="${2:-}"; PM_PARENT_EXPLICIT=1; shift 2 ;;
       --skip-pm-smoke) PM_SKIP_SMOKE=1; shift ;;
       --uninstall) DO_UNINSTALL=1; shift ;;
       --purge)     PURGE=1; shift ;;
@@ -168,7 +171,7 @@ parse_args() {
   # example.com) invents a name the operator never configured, and the install
   # then dies on a wildcard check for a record that does not exist. It is
   # resolved later, by asking, in resolve_pm_parent().
-  PM_PARENT="${PM_PARENT,,}"
+  PM_PARENT="${PM_PARENT_FLAG,,}"
   PM_PARENT="${PM_PARENT#\*.}"      # accept "*.apps.example.com"
   PM_PARENT="${PM_PARENT%.}"
 }
@@ -878,10 +881,19 @@ host serving OpenCode, and the wildcard usually lives somewhere else entirely
 EOF
   local reply
   while :; do
-    printf 'Parent domain that has a wildcard record pointing here: ' >&2
-    IFS= read -r reply || return 1
+    # No default is offered and --domain is deliberately not echoed into the
+    # field: a pre-filled answer turns Enter into a silent acceptance of a parent
+    # the operator never chose, which then fails the wildcard check further down.
+    printf 'Parent domain that has a wildcard record pointing here\n' >&2
+    printf '(leave empty to skip pm): ' >&2
+    IFS= read -r reply || { warn "no answer given"; return 2; }
     reply="${reply,,}"; reply="${reply#\*.}"; reply="${reply%.}"
-    [ -n "$reply" ] || { warn "please type a domain, or leave --with-pm off"; return 1; }
+    # An empty answer is a decision, not a mistake: pm is optional, so honour it
+    # instead of re-asking until the operator is annoyed into typing something.
+    if [ -z "$reply" ]; then
+      printf '\nSkipping pm install.\n' >&2
+      return 2
+    fi
     case "$reply" in
       *.*.*) ;;
       *) warn "'$reply' does not look like a parent domain (expected at least two labels)"; continue ;;
@@ -890,6 +902,7 @@ EOF
       *[!a-z0-9.-]*) warn "'$reply' contains characters that are not valid in a domain name"; continue ;;
     esac
     PM_PARENT="$reply"
+    PM_PARENT_EXPLICIT=1
     return 0
   done
 }
@@ -926,8 +939,14 @@ resolve_pm_parent() {
   fi
   # 4. Ask. Never guess.
   if [ -t 0 ]; then
-    prompt_pm_parent || return 1
-    return 0
+    # prompt_pm_parent returns 2 when the operator declines by leaving it empty;
+    # that is a skip, not a failure, and must reach main() as PM_SKIPPED.
+    prompt_pm_parent
+    case $? in
+      0) return 0 ;;
+      2) PM_PARENT=""; return 2 ;;
+      *) return 1 ;;
+    esac
   fi
   warn "no TTY and no --pm-parent, so the pm parent cannot be determined.
     Skipping pm. Re-run with:  --pm-parent <domain-with-wildcard>"
@@ -952,8 +971,28 @@ pm_parent_precheck() {
     install-pm.sh if you are certain the records are correct."
     return 1
   fi
-  local expect
-  expect="$(pm_public_ip)"
+  local expect resolved
+  expect="${PUBLIC_IP:-}"
+  [ -n "$expect" ] || expect="$(pm_public_ip)"
+  resolved="$(pm_probe_ip "pm-test-$$-$RANDOM.$PM_PARENT")"
+
+  # An EXPLICITLY named parent that fails is the operator's typo or a DNS record
+  # they have not made yet. Reporting that as a cheerful "skipped" would hide the
+  # fact they asked for something and did not get it, so it fails loudly — before
+  # any filesystem change. A parent we GUESSED (Caddyfile detection, no flag) must
+  # not do that: the guess never became an instruction, so a skip is correct.
+  if [ "$PM_PARENT_EXPLICIT" = 1 ]; then
+    cat >&2 <<EOF
+
+$(printf '%sERROR: no wildcard for *.%s points to this host (%s).%s' "$R" "$PM_PARENT" "${expect:-UNKNOWN_IP}" "$N")
+  Got: '$resolved'
+  Fix the wildcard DNS (or provide a different parent) and re-run.
+  Nothing was installed for pm; OpenCode 2 is installed and working.
+
+EOF
+    return 2
+  fi
+
   cat >&2 <<EOF
 
 $(printf '%spm installation skipped: wildcard DNS is not configured for the parent domain.%s' "$Y" "$N")
@@ -1556,23 +1595,43 @@ main() {
   # afterwards walks the operator into a failure, and a failed optional component
   # must never fail the install that already succeeded.
   if [ "$WITH_PM" != "no" ] || pm_installed; then
-    if resolve_pm_parent && pm_parent_precheck; then
-      if pm_should_install; then
-        install_pm
-        restart_opencode_for_mcp
-        verify_pm
-      else
-        PM_INSTALLED=0
-      fi
-    else
-      PM_INSTALLED=0
-      PM_SKIPPED="pm (no usable parent domain)"
-    fi
+    # resolve_pm_parent returns 2 when the operator declines at the prompt, 1 when
+    # it could not be determined. Both skip pm without failing the install, but
+    # the summary should say which happened.
+    resolve_pm_parent
+    case $? in
+      0) ;;
+      2) PM_INSTALLED=0; PM_SKIPPED="pm (declined at prompt)" ;;
+      *) PM_INSTALLED=0; PM_SKIPPED="pm (parent domain not determined)" ;;
+    esac
   else
     PM_INSTALLED=0
   fi
 
+  if [ -n "$PM_PARENT" ] && [ "$PM_SKIPPED" = "" ]; then
+    pm_parent_precheck
+    case $? in
+      0)
+        if pm_should_install; then
+          install_pm
+          restart_opencode_for_mcp
+          verify_pm
+        else
+          PM_INSTALLED=0
+        fi ;;
+      # The operator named a parent and its wildcard does not point here. That is
+      # an unmet request, not an optional component quietly dropping out. Defer
+      # the failure to the end so print_summary still reports the OpenCode half
+      # that DID succeed, instead of dying with no account of it. The check runs
+      # before any filesystem change, so re-running is clean.
+      2) PM_INSTALLED=0; PM_SKIPPED="pm FAILED (no wildcard for *.$PM_PARENT)"; PM_FATAL=1 ;;
+      *) PM_INSTALLED=0; PM_SKIPPED="pm (no wildcard DNS for $PM_PARENT)" ;;
+    esac
+  fi
+
   print_summary
+  [ "$PM_FATAL" = 1 ] && exit 1
+  return 0
 }
 
 main "$@"

@@ -93,12 +93,48 @@ assert_eq "PM_ALLOW_DOMAINS host is authorized (the OpenCode site)" 200 "$(gate 
 assert_eq "gate also accepts POST {domain}" 200 \
 	"$(curl -s -o /dev/null -w '%{http_code}' -X POST "$API/internal/check-domain" -H 'Content-Type: application/json' -d '{"domain":"legacy.example.com"}')"
 
+# Defence in depth: the gate must hold even if a caller skips createProject.
+assert_eq "empty domain is refused" 403 "$(gate '')"
+assert_eq "dot-only domain is refused" 403 "$(gate '.')"
+assert_eq "wildcard domain is refused" 403 "$(gate "*.$PARENT")"
+assert_eq "double-dot domain is refused" 403 "$(gate "a..b.$PARENT")"
+assert_eq "the apex itself is refused" 403 "$(gate "$PARENT")"
+# PM_ALLOW_DOMAINS is checked before the structural rules, so an explicitly
+# authorised apex-style name must still pass.
+assert_eq "an allowlisted apex name is still authorised" 200 "$(gate "opencode-site.$PARENT")"
+
 # ------------------------------------------------------------- validation
 section "create: validation"
 assert_eq "bad name is 400" 400 "$(status_of POST /projects '{"name":"Bad_Name"}')"
 assert_has "bad name explains the rule" 'want ^[a-z][a-z0-9-]{1,30}$' "$(jqf 1 .error)"
 assert_eq "subdomain outside the parent is 400" 400 \
 	"$(status_of POST /projects '{"name":"stray","subdomain":"stray.evil.com"}')"
+
+# A subdomain becomes a Caddy host matcher verbatim, so malformed shapes must
+# be refused. "*.<parent>" is the dangerous one: a wildcard matcher would shadow
+# every sibling project, and the apex would shadow the platform's own site.
+assert_eq "empty subdomain is 400" 400 \
+	"$(status_of POST /projects '{"name":"e1","subdomain":""}')"
+assert_eq "dot-only subdomain is 400" 400 \
+	"$(status_of POST /projects '{"name":"e2","subdomain":"."}')"
+assert_eq "double-dot subdomain is 400" 400 \
+	"$(status_of POST /projects '{"name":"e3","subdomain":"a..b.'"$PARENT"'"}')"
+assert_eq "wildcard subdomain is 400" 400 \
+	"$(status_of POST /projects '{"name":"e4","subdomain":"*.'"$PARENT"'"}')"
+assert_eq "apex domain is 400 (reserved for platform services)" 400 \
+	"$(status_of POST /projects '{"name":"e5","subdomain":"'"$PARENT"'"}')"
+assert_has "apex rejection explains why" 'reserved' \
+	"$(jqf 1 .error)"
+# A trailing dot is not a child of the parent, so it must not be accepted
+# either. (A spec line expected "valid." -> 200; that input is not a valid
+# child of the parent, so it is asserted as rejected.)
+assert_eq "trailing-dot subdomain is 400" 400 \
+	"$(status_of POST /projects '{"name":"e6","subdomain":"valid."}')"
+# The positive control: an ordinary child of the parent is still accepted.
+assert_eq "a valid child of the parent is accepted" 201 \
+	"$(status_of POST /projects '{"name":"validkid","subdomain":"valid.'"$PARENT"'"}')"
+curl -s -o /dev/null -X DELETE "$API/projects/validkid?purge=1" \
+	-H "Authorization: Bearer $TOKEN" >/dev/null 2>&1 || true
 
 # A body that is not JSON must be reported as such. Previously readBody()
 # resolved `{}` on a parse failure, so createProject() received an empty object
@@ -211,6 +247,27 @@ assert_eq "stale project dropped from state.json" 0 \
 assert_eq "its Caddy route was released" 0 "$(routes_of | grep -c "blog.$PARENT")"
 assert_eq "the gate refuses its subdomain" 403 "$(gate blog.$PARENT)"
 assert_has "the reason is logged" "no longer exists" "$(cat "$WORK/logs/pmd3.log")"
+
+# Same class of bug one hop further out: state.json is restored from backups and
+# edited by hand, so a subdomain that never passed createProject's checks can
+# reach caddySync and become a Caddy host matcher. A stored wildcard would
+# shadow every sibling project, so reconcile must re-validate what it reads.
+# Seed the entry outright: the block above emptied state.json, so mapping over
+# the existing projects would produce nothing and the assertion would pass
+# without ever exercising the check.
+printf '[Service]\nExecStart=/bin/true\n' > "$WORK/units/pm-sneaky.service"
+jq -n --arg parent "$PARENT" '{projects:[{name:"sneaky", subdomain:("*."+$parent),
+	path:"'"$WORK"'/projects/sneaky", port:4501, unit:"pm-sneaky.service", status:"running"}]}' \
+	> "$WORK/state/state.json"
+assert_eq "the invalid entry is really in state.json before the restart" "sneaky" \
+	"$(jq -r '.projects[0].name' "$WORK/state/state.json")"
+cleanup_pid $PMD
+node "$PM/daemon/index.js" >"$WORK/logs/pmd4.log" 2>&1 & PMD=$!
+for _ in $(seq 1 40); do curl -fsS --max-time 1 "$API/health" >/dev/null 2>&1 && break; sleep 0.25; done
+assert_eq "a wildcard subdomain in state.json is dropped" 0 \
+	"$(jq '[.projects[] | select(.name=="sneaky")] | length' "$WORK/state/state.json")"
+assert_eq "no wildcard route reached caddy" 0 "$(routes_of | grep -c '"\*' || true)"
+assert_has "the invalid subdomain is logged" 'not a valid child' "$(cat "$WORK/logs/pmd4.log")"
 
 section "daemon restart re-asserts caddy routes from state.json"
 # Recreate the project so there is something to rebuild.

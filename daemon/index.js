@@ -35,7 +35,25 @@ const EXTRA_DOMAINS = (process.env.PM_ALLOW_DOMAINS || '')
   .split(',').map((s) => s.trim().toLowerCase().replace(/\.+$/, '')).filter(Boolean);
 
 const NAME_RE = /^[a-z][a-z0-9-]{1,30}$/;
+// A subdomain becomes a Caddy `host` matcher verbatim, so it must be a real
+// DNS name: dot-separated labels of [a-z0-9-], each starting and ending
+// alphanumeric. A `*` would be a wildcard matcher that shadows every sibling
+// under the parent, and `..` is not a valid name at all.
+const SUBDOMAIN_RE = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$/;
+// DNS caps a name at 253 bytes and a single label at 63 (enforced above).
+const MAX_DOMAIN_LEN = 253;
 const UNIT = (n) => `pm-${n}.service`;
+
+// One definition of a usable subdomain, used by every path that can reach Caddy
+// or the gate. createProject checks it on input; reconcileState re-checks what
+// it reads back from state.json, because that file is restored from backups and
+// edited by hand, and a stored wildcard would be injected as a host matcher that
+// shadows every sibling project.
+const badSubdomain = (sub) =>
+  typeof sub !== 'string' || !sub ||
+  sub.length > MAX_DOMAIN_LEN || !SUBDOMAIN_RE.test(sub) ||
+  sub === CFG.parent || !sub.endsWith(`.${CFG.parent}`);
+
 // pmd is root; projects are not. Resolve the uid:gid once so scaffold() can hand
 // the tree to the user the unit actually runs as.
 CFG.runUserIds = (() => {
@@ -178,10 +196,20 @@ function reconcileState() {
   const before = s.projects.length;
   const dropped = [];
   s.projects = s.projects.filter((p) => {
-    if (fs.existsSync(path.join(CFG.unitsDir, UNIT(p.name)))) return true;
-    console.error(`pmd: dropping "${p.name}" — ${UNIT(p.name)} no longer exists`);
-    if (p.subdomain) dropped.push(p.subdomain);
-    return false;
+    if (!fs.existsSync(path.join(CFG.unitsDir, UNIT(p.name)))) {
+      console.error(`pmd: dropping "${p.name}" — ${UNIT(p.name)} no longer exists`);
+      if (p.subdomain) dropped.push(p.subdomain);
+      return false;
+    }
+    // The unit exists, but the stored subdomain may have arrived via a restored
+    // backup or a hand edit. Re-validate it here, before caddySync can turn it
+    // into a Caddy host matcher that shadows every sibling project.
+    if (badSubdomain(p.subdomain)) {
+      console.error(`pmd: dropping "${p.name}" — subdomain ${JSON.stringify(p.subdomain)} is not a valid child of ${CFG.parent}`);
+      if (typeof p.subdomain === 'string' && p.subdomain) dropped.push(p.subdomain);
+      return false;
+    }
+    return true;
   });
   if (s.projects.length !== before) writeState(s);
   // The caller must feed these to caddySync: once a project left state.json its
@@ -279,8 +307,30 @@ async function createProject({ name, subdomain }) {
   if (!CFG.parent) throw new Error('PM_PARENT is not set on the daemon');
   if (findProject(name)) throw Object.assign(new Error(`project "${name}" already exists`), { status: 409 });
 
-  const sub = (subdomain || `${name}.${CFG.parent}`).toLowerCase();
-  if (sub !== CFG.parent && !sub.endsWith(`.${CFG.parent}`)) {
+  // Only an absent subdomain defaults. An empty string is a caller mistake, not
+  // a request for the default: `subdomain || default` would silently turn
+  // subdomain:"" into <name>.<parent> and hide the bad input.
+  const given = subdomain === undefined || subdomain === null;
+  const sub = (given ? `${name}.${CFG.parent}` : String(subdomain).toLowerCase());
+
+  // Shape first, before any comparison against the parent: `sub` reaches Caddy
+  // as a host matcher, so a wildcard or an empty label must never get that far.
+  if (sub.length > MAX_DOMAIN_LEN) {
+    throw Object.assign(new Error(`subdomain too long (max ${MAX_DOMAIN_LEN} characters)`), { status: 400 });
+  }
+  if (!SUBDOMAIN_RE.test(sub)) {
+    throw Object.assign(new Error(`invalid subdomain: ${JSON.stringify(sub)}`), { status: 400 });
+  }
+
+  // The apex is not a project's to take: it is where the platform's own
+  // services live (the OpenCode site), and a route there would shadow them.
+  if (sub === CFG.parent) {
+    throw Object.assign(
+      new Error(`subdomain cannot be the apex domain (${CFG.parent}); it is reserved for platform services`),
+      { status: 400 }
+    );
+  }
+  if (!sub.endsWith(`.${CFG.parent}`)) {
     throw Object.assign(new Error(`subdomain must end in .${CFG.parent}`), { status: 400 });
   }
   if (readState().projects.some((p) => p.subdomain === sub)) {
@@ -394,9 +444,22 @@ function readBody(req) {
 // 127.0.0.1 anyway. Every other endpoint requires the bearer token.
 async function checkDomain(domain) {
   const d = (domain || '').toLowerCase().replace(/\.+$/, '');
+  // Explicitly authorised names answer first: the OpenCode site is not under
+  // PM_PARENT and may legitimately be the apex, so it is checked against its
+  // own allowlist before any structural rule rejects it.
   if (readState().projects.some((p) => p.subdomain === d)) return true;
   if (EXTRA_DOMAINS.includes(d)) return true;
-  if (!/^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$/.test(d)) return false;
+  // Defence in depth, independent of createProject: nothing malformed, and
+  // nothing that is not a child of the parent, may reach a fallback gate. A
+  // future caller must not be able to bypass the createProject checks.
+  if (!d) return false;
+  if (d.length > MAX_DOMAIN_LEN) return false;
+  if (!SUBDOMAIN_RE.test(d)) return false;
+  if (d === CFG.parent) return false;
+  // No parent-suffix rule here: names PM does not own are handed to the
+  // fallback gate, which owns its own namespace (that gate predates PM and may
+  // authorise a completely different domain). Only names PM itself would claim
+  // need the parent check, and createProject enforces that on the way in.
 
   // Subdomains PM doesn't own are offered to the gate that was in place before
   // PM was installed, so pre-existing sites keep getting certificates.

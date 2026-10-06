@@ -2,6 +2,74 @@
 
 All notable changes to this project are documented here.
 
+## [0.2.3] — 2026-10-06
+
+Restricts what a pm project may claim. A subdomain becomes a Caddy `host`
+matcher verbatim, so anything that is not a real DNS name — or is the apex — was
+written straight into the proxy configuration.
+
+### Fixed
+
+- **A project could claim the apex domain.** `createProject` explicitly allowed
+  `subdomain === PM_PARENT`, so a project could take the hostname where the
+  platform's own OpenCode site lives and shadow it. The apex is now reserved and
+  returns `400`.
+- **`subdomain` had no character validation at all.** Only the `.parent` suffix
+  was checked, so `*.example.com` was accepted and became a wildcard Caddy host
+  matcher that shadows every sibling project. Subdomains are now validated as
+  real DNS names: dot-separated labels of `[a-z0-9-]` starting and ending
+  alphanumeric, no `*`, no empty or doubled labels, at most 253 characters.
+- **An empty `subdomain` silently became the default.** `subdomain || default`
+  treated `""` as absent, so a caller sending `subdomain: ""` got
+  `<name>.<parent>` and no indication that its input was ignored. Only an absent
+  (`undefined`/`null`) subdomain now defaults; `""` is a `400`.
+- **The `on_demand_tls` gate validated independently.** `checkDomain` now
+  rejects empty, over-long, malformed and apex names before they can reach a
+  fallback gate, so a future caller cannot bypass the `createProject` checks.
+  Explicitly authorised names (`PM_ALLOW_DOMAINS`) are still answered first, so
+  the OpenCode site keeps its certificate.
+- **`state.json` was trusted on startup.** `reconcileState` dropped entries whose
+  unit file was missing but passed any stored `subdomain` through unchecked, and
+  `caddySync` writes it to Caddy verbatim. Since that file is restored from
+  backups and edited by hand, a stored wildcard would have been injected as a
+  host matcher. Reconciliation now re-validates what it reads, using the same
+  definition as `createProject`.
+- **A malformed JSON body blamed the wrong field.** `readBody` resolved `{}` when
+  parsing failed, so `POST /projects` answered `invalid name` for a body the
+  caller had never sent a name in. It now answers `request body is not valid
+  JSON`. An empty body still means `{}`. Oversized bodies return `413` instead of
+  resetting the connection, which previously left the client with no status at
+  all.
+
+### Lessons
+
+- **Do not use `pkill -f` with a broad pattern during cleanup.** A `pkill -f` of a
+  test process name matched an unrelated process on the host and sent it SIGTERM.
+  Match precisely and signal the PID: `pgrep -f '<exact pattern>' | xargs -r
+  kill <pid>`, then confirm the intended PID only.
+- **A passing assertion is not evidence until its precondition is checked.** The
+  first version of the `state.json` wildcard test mapped over a project list that
+  an earlier step had emptied, so it never created the entry it claimed to test
+  and passed vacuously. It now asserts the entry exists before the restart, and
+  the whole set was re-verified to fail against the unfixed daemon.
+- **Three claims from an earlier audit of this codebase were wrong and are
+  retracted.** `caddySync` is not "non-atomic" in a way that needs fixing: the
+  `DELETE` + `POST` sequence is required by Caddy and is what puts exact-host
+  routes ahead of the `*.parent` wildcard, which a per-route rewrite would
+  invert and break. Rate limiting is not missing in a way that matters — the
+  daemon binds `127.0.0.1`, so a per-IP limit is a global one that throttles
+  legitimate bursts. And `deleteProject` does not need to poll for the unit to
+  stop, because `systemctl disable --now` already waits.
+
+### Tests
+
+`local-test.sh` grows from 89 to 112 assertions. New coverage: malformed, empty
+and oversized request bodies; wildcard, apex, empty, dot-only, double-dot and
+trailing-dot subdomains; a positive control that an ordinary child is still
+accepted; gate-level refusal of the same malformed shapes; and a startup
+reconcile case where `state.json` holds a wildcard that must never reach Caddy.
+`caddy-config-test.sh` is unchanged at 7.
+
 ## [0.2.2] — 2026-10-06
 
 Fixes two regressions in `0.2.1`: the parent prompt could confirm the wrong answer

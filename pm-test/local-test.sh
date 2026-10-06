@@ -42,6 +42,25 @@ status_of() { api "$@" | head -1; }
 jqf() { sed -n "$1p" "$WORK/body" | jq -r "$2" 2>/dev/null; }
 routes_of() { curl -s http://127.0.0.1:8390/config/apps/http/servers/srv0/routes; }
 cleanup_pid() { kill "$1" 2>/dev/null; wait "$1" 2>/dev/null; }
+# The fake systemctl really starts a python http.server per project, so anything
+# still running at exit holds its port. Left behind, they fill 4500-4600 and the
+# next run fails with "no free port" long before it reaches a real assertion.
+stop_project_servers() {
+	local pf
+	for pf in "$WORK"/run/*.pid; do
+		[ -e "$pf" ] || continue
+		kill "$(cat "$pf" 2>/dev/null)" 2>/dev/null
+		rm -f "$pf"
+	done
+	# Belt and braces: the pidfile is gone by the time a project has been
+	# stopped and restarted, so also match any server still serving out of this
+	# run's directory. The pattern names $WORK explicitly, so it cannot reach a
+	# production project, and it is a pid list — never a broad `pkill -f`.
+	local stray
+	for stray in $(pgrep -f "http\.server .*--directory $WORK/projects/" 2>/dev/null); do
+		kill "$stray" 2>/dev/null
+	done
+}
 
 # ------------------------------------------------------------------ set-up
 rm -rf "$WORK"; mkdir -p "$WORK"/{bin,state,projects,units,run,logs}
@@ -64,7 +83,7 @@ FAKES=$!
 NODE_OPTIONS="--require $HERE/fake-dns-tls.js" \
 	node "$PM/daemon/index.js" >"$WORK/logs/pmd.log" 2>&1 &
 PMD=$!
-trap 'cleanup_pid $PMD; cleanup_pid $FAKES' EXIT
+trap 'stop_project_servers; cleanup_pid $PMD; cleanup_pid $FAKES' EXIT
 
 for _ in $(seq 1 40); do curl -fsS --max-time 1 "$API/health" >/dev/null 2>&1 && break; sleep 0.25; done
 
@@ -268,6 +287,89 @@ assert_eq "a wildcard subdomain in state.json is dropped" 0 \
 	"$(jq '[.projects[] | select(.name=="sneaky")] | length' "$WORK/state/state.json")"
 assert_eq "no wildcard route reached caddy" 0 "$(routes_of | grep -c '"\*' || true)"
 assert_has "the invalid subdomain is logged" 'not a valid child' "$(cat "$WORK/logs/pmd4.log")"
+
+section "a stored path outside the projects dir cannot become an rm -rf"
+# deleteProject(purge) hands state.json's "path" to `rm -rf` as root. A state
+# file that arrived from a merge, a moved projects dir or a hand edit can carry a
+# path the daemon never created; that must never be followed.
+SENTINEL="$WORK/not-a-project-dir"
+mkdir -p "$SENTINEL" && echo "must survive" > "$SENTINEL/precious.txt"
+printf '[Service]\nExecStart=/bin/true\n' > "$WORK/units/pm-outside.service"
+jq -n --arg p "$SENTINEL" '{projects:[{name:"outside", subdomain:("outside."+$parent),
+	path:$p, port:4502, unit:"pm-outside.service", status:"running"}]}' \
+	--arg parent "$PARENT" > "$WORK/state/state.json"
+cleanup_pid $PMD
+node "$PM/daemon/index.js" >"$WORK/logs/pmd5.log" 2>&1 & PMD=$!
+for _ in $(seq 1 40); do curl -fsS --max-time 1 "$API/health" >/dev/null 2>&1 && break; sleep 0.25; done
+assert_eq "the entry with a foreign path is dropped" 0 \
+	"$(jq '[.projects[] | select(.name=="outside")] | length' "$WORK/state/state.json")"
+assert_has "the foreign path is logged" 'is not' "$(cat "$WORK/logs/pmd5.log")"
+
+# The second half: a record injected while the daemon is already running never
+# reaches reconcile, so deleteProject must refuse on its own.
+jq -n --arg p "$SENTINEL" '{projects:[{name:"outside", subdomain:("outside."+$parent),
+	path:$p, port:4502, unit:"pm-outside.service", status:"running"}]}' \
+	--arg parent "$PARENT" > "$WORK/state/state.json"
+PURGE_OUT="$(curl -s -X DELETE -H "Authorization: Bearer $TOKEN" "$API/projects/outside?purge=1")"
+assert_eq "purge reports it did NOT purge" "false" "$(echo "$PURGE_OUT" | jq -r .purged)"
+assert_eq "the sentinel directory survived" "must survive" "$(cat "$SENTINEL/precious.txt")"
+assert_has "the refusal is logged" 'not purging' "$(cat "$WORK/logs/pmd5.log")"
+# The other half, and the one a regression actually broke once: a legitimate
+# purge must still report purged:true. Without this, a deleteProject that never
+# removes anything would pass every other assertion here.
+assert_eq "a real project to purge is created" 201 "$(status_of POST /projects '{"name":"purgeable"}')"
+REAL_PURGE="$(curl -s -X DELETE -H "Authorization: Bearer $TOKEN" "$API/projects/purgeable?purge=1")"
+assert_eq "a legitimate purge reports purged:true" "true" "$(echo "$REAL_PURGE" | jq -r .purged)"
+assert_eq "a legitimate purge really removed the directory" "" "$(ls "$WORK/projects/purgeable" 2>/dev/null || true)"
+
+section "an unreadable state file is not mistaken for an empty one"
+# readState() used to swallow a parse failure and answer {projects:[]}. Startup
+# caddySync then saw "no project owns a route" and deleted every pm route, so a
+# corrupt registry silently took all projects offline.
+BEFORE_ROUTES="$(routes_of)"
+# Give the assertion something to lose: without a pm route in Caddy, "routes are
+# untouched" would also hold if the daemon stripped every one of them.
+assert_eq "a project to protect is created" 201 "$(status_of POST /projects '{"name":"guardrail"}')"
+assert_eq "its route is in caddy before the corruption" 1 "$(routes_of | grep -c "guardrail.$PARENT" || true)"
+BEFORE_ROUTES="$(routes_of)"
+printf '{"projects":[{"name":"trunc","port":4503' > "$WORK/state/state.json"
+cleanup_pid $PMD
+node "$PM/daemon/index.js" >"$WORK/logs/pmd6.log" 2>&1 & PMD=$!
+for _ in $(seq 1 40); do curl -fsS --max-time 1 "$API/health" >/dev/null 2>&1 && break; sleep 0.25; done
+assert_has "the unreadable registry is reported, not swallowed" 'not valid JSON' \
+	"$(cat "$WORK/logs/pmd6.log")"
+assert_has "it says the registry is unknown, not empty" 'UNKNOWN, not empty' \
+	"$(cat "$WORK/logs/pmd6.log")"
+assert_has "the route sync is skipped on purpose" 'skipping the Caddy route sync' \
+	"$(cat "$WORK/logs/pmd6.log")"
+assert_eq "Caddy routes are left untouched" "$BEFORE_ROUTES" "$(routes_of)"
+assert_eq "the live project's route specifically survived" 1 \
+	"$(routes_of | grep -c "guardrail.$PARENT" || true)"
+
+# Writing must not destroy the damaged file: it is the only copy of the records.
+curl -s -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+	-d '{"name":"aftercorrupt"}' "$API/projects" >/dev/null 2>&1 || true
+assert_eq "a copy of the damaged file is kept" 1 \
+	"$(ls "$WORK/state" | grep -c 'state.json.unreadable.' || true)"
+assert_has "the salvage is logged" 'unreadable' "$(cat "$WORK/logs/pmd6.log")"
+# The salvage must be byte-identical to what was on disk, or it is no use: the
+# whole point is that the operator can recover the records by hand.
+SALVAGE="$(ls "$WORK/state"/state.json.unreadable.* 2>/dev/null | head -1)"
+if [ -n "$SALVAGE" ]; then
+	assert_eq "the salvage is byte-identical to the damaged file" \
+		"$(cat "$WORK/state/state.json.unreadable."* 2>/dev/null | md5sum | cut -d' ' -f1)" \
+		"$(printf '{"projects":[{"name":"trunc","port":4503' | md5sum | cut -d' ' -f1)"
+else
+	assert_eq "the salvage exists" "yes" "no"
+fi
+# That create was a real project; remove it so the sections below still see only
+# the projects they create for themselves.
+curl -s -X DELETE -H "Authorization: Bearer $TOKEN" \
+	"$API/projects/aftercorrupt?purge=1" >/dev/null 2>&1 || true
+curl -s -X DELETE -H "Authorization: Bearer $TOKEN" \
+	"$API/projects/guardrail?purge=1" >/dev/null 2>&1 || true
+assert_eq "the throwaway project is gone" 0 \
+	"$(jq '[.projects[] | select(.name=="aftercorrupt")] | length' "$WORK/state/state.json")"
 
 section "daemon restart re-asserts caddy routes from state.json"
 # Recreate the project so there is something to rebuild.

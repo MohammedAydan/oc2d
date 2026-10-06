@@ -72,17 +72,49 @@ function run(cmd, args, opts = {}) {
   return { code: r.status === null ? 1 : r.status, out: (r.stdout || '').trim(), err: (r.stderr || '').trim() };
 }
 
+// Set when state.json exists but cannot be parsed. That is not the same as an
+// empty registry: the projects still exist, we just cannot read them, so the
+// daemon must not conclude "no route is ours" and delete them all from Caddy.
+let stateUnreadable = false;
+
 function readState() {
+  let raw;
   try {
-    const s = JSON.parse(fs.readFileSync(CFG.stateFile, 'utf8'));
-    return Array.isArray(s.projects) ? s : { projects: [] };
-  } catch {
+    raw = fs.readFileSync(CFG.stateFile, 'utf8');
+  } catch (e) {
+    // A missing file is a legitimate first run. Anything else is not.
+    if (e.code !== 'ENOENT') {
+      stateUnreadable = true;
+      console.error(`pmd: cannot read ${CFG.stateFile} (${e.message}) — the project registry is UNKNOWN, not empty`);
+    }
+    return { projects: [] };
+  }
+  try {
+    const s = JSON.parse(raw);
+    if (!Array.isArray(s.projects)) throw new Error('no "projects" array');
+    return s;
+  } catch (e) {
+    stateUnreadable = true;
+    console.error(`pmd: ${CFG.stateFile} is not valid JSON (${e.message}) — the project registry is UNKNOWN, not empty.`);
+    console.error('pmd: refusing to touch Caddy routes, because releasing them would take every project offline.');
     return { projects: [] };
   }
 }
 
 function writeState(s) {
   fs.mkdirSync(path.dirname(CFG.stateFile), { recursive: true, mode: 0o750 });
+  // Never destroy an unreadable registry: keep the damaged file so it can be
+  // repaired by hand, instead of replacing it with an empty list.
+  if (stateUnreadable) {
+    const salvage = `${CFG.stateFile}.unreadable.${Date.now()}`;
+    try {
+      fs.copyFileSync(CFG.stateFile, salvage);
+      console.error(`pmd: kept the unreadable ${CFG.stateFile} as ${salvage} before writing`);
+    } catch (e) {
+      console.error(`pmd: could not keep a copy of the unreadable state file: ${e.message}`);
+    }
+    stateUnreadable = false;
+  }
   const tmp = `${CFG.stateFile}.tmp`;
   fs.writeFileSync(tmp, JSON.stringify(s, null, 2) + '\n', { mode: 0o640 });
   fs.renameSync(tmp, CFG.stateFile); // atomic
@@ -209,6 +241,13 @@ function reconcileState() {
       if (typeof p.subdomain === 'string' && p.subdomain) dropped.push(p.subdomain);
       return false;
     }
+    // Same reasoning for the directory: a stored path outside the projects dir
+    // would be handed to `rm -rf` as root by deleteProject(purge).
+    if (p.path !== expectedPath(p.name)) {
+      console.error(`pmd: dropping "${p.name}" — path ${JSON.stringify(p.path)} is not ${expectedPath(p.name)}`);
+      if (typeof p.subdomain === 'string' && p.subdomain) dropped.push(p.subdomain);
+      return false;
+    }
     return true;
   });
   if (s.projects.length !== before) writeState(s);
@@ -250,6 +289,13 @@ async function caddySync(droppedSubdomains = []) {
 }
 
 async function caddySyncQuiet(drop) {
+  // Routes are derived from the registry, so an unreadable registry means the
+  // route set is unknown. Releasing every pm route would take every project
+  // offline, so decline to change anything until the file is readable again.
+  if (stateUnreadable) {
+    console.error('pmd: skipping the Caddy route sync while the project registry is unreadable');
+    return 0;
+  }
   try { return await caddySync(drop); } catch (e) { console.error('pmd: caddy sync:', e.message); return 0; }
 }
 
@@ -385,9 +431,17 @@ async function createProject({ name, subdomain }) {
   }
 }
 
+// A project's directory is always exactly <projectsDir>/<name>. Nothing else is
+// legitimate, and deleteProject(purge) hands this string to `rm -rf` as root, so
+// a state file carrying a path from elsewhere — a merge, a move of the projects
+// directory, a hand edit — would otherwise turn a delete into an arbitrary
+// recursive removal. Reconcile drops such an entry; purge refuses to act on it.
+const expectedPath = (name) => path.join(CFG.projectsDir, name);
+
 async function deleteProject(name, purge) {
   const p = findProject(name);
   if (!p) throw Object.assign(new Error(`no such project "${name}"`), { status: 404 });
+  let purged = false;
 
   run('systemctl', ['disable', '--now', UNIT(name)], { timeout: 20000 });
   fs.rmSync(path.join(CFG.unitsDir, UNIT(name)), { force: true });
@@ -398,8 +452,18 @@ async function deleteProject(name, purge) {
   writeState(s);
   await caddySyncQuiet([p.subdomain]);
 
-  if (purge) fs.rmSync(p.path, { recursive: true, force: true });
-  return { deleted: name, purged: !!purge, subdomain: p.subdomain || null };
+  if (purge) {
+    // Never rm -rf a path we did not derive ourselves. The record is dropped
+    // either way; only the filesystem removal is conditional on the path being
+    // the one this daemon would have created.
+    if (p.path === expectedPath(name)) {
+      fs.rmSync(p.path, { recursive: true, force: true });
+      purged = true;
+    } else {
+      console.error(`pmd: not purging "${name}" — stored path ${JSON.stringify(p.path)} is not ${expectedPath(name)}`);
+    }
+  }
+  return { deleted: name, purged: !!purge && purged, subdomain: p.subdomain || null };
 }
 
 // ----------------------------------------------------------------- plumbing

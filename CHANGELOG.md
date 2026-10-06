@@ -2,6 +2,83 @@
 
 All notable changes to this project are documented here.
 
+## [0.2.5] — 2026-10-06
+
+Two findings from the release audit, both reproduced before being fixed. Both are
+about state.json: it is the only record of what pm manages, and both bugs came
+from trusting it after it should have been questioned.
+
+### Fixed
+
+- **A stored `path` could turn a delete into an arbitrary `rm -rf` as root.**
+  `deleteProject(purge)` passed `state.json`'s `path` straight to
+  `fs.rmSync(..., { recursive: true, force: true })`. `createProject` always
+  writes `<projectsDir>/<name>`, but nothing re-checked it, and `reconcileState`
+  — which drops entries whose unit vanished — validated `subdomain` but not
+  `path`. Reproduced: a `state.json` whose `path` named a directory outside the
+  projects dir had that directory destroyed by `DELETE /projects/x?purge=1`.
+  A project's directory is now always exactly `path.join(projectsDir, name)`.
+  Reconciliation drops an entry that says otherwise, and a purge that is handed
+  one deletes the record but **not** the files, answering `purged: false` rather
+  than claiming a purge that did not happen. This was the same class of bug as
+  the v0.2.3 wildcard: one field on that path was hardened and the more dangerous
+  one was left alone.
+- **An unreadable registry was silently treated as an empty one.** `readState()`
+  swallowed every read and parse failure and answered `{ projects: [] }` with no
+  log line at all. A registry that cannot be read is not a registry with nothing
+  in it, and the difference matters: `GET /projects` reported no projects, and
+  the next state write replaced the file with that empty list — turning a
+  transient read failure (a permission or I/O error, while the bytes on disk were
+  perfectly fine) into permanent loss of every project record. `readState` now
+  distinguishes a missing file, which is a legitimate first run, from a file it
+  cannot read, logs the path and the error loudly, and declines to sync Caddy
+  while the registry is unknown. Writing now copies the damaged file to
+  `state.json.unreadable.<timestamp>` first, so the records can be recovered by
+  hand.
+
+  **A correction to an earlier claim in this changelog's own audit:** the first
+  version of this finding said a corrupt registry would delete every Caddy route
+  and take all projects offline. That was wrong, and testing it disproved it.
+  `caddySync` keeps every route whose host is not in the set of subdomains pm
+  claims, so an empty registry keeps everything. The routes were never at risk.
+  What was real is the silent invisibility and the destructive overwrite, which
+  is what is fixed here.
+
+### Tests
+
+`local-test.sh` 114 → **133**. New coverage: a sentinel directory outside the
+projects dir must survive both the reconcile drop and a `purge=1` delete; the
+purge response must say it did not purge; an unreadable registry must be logged
+as unknown-not-empty, must skip the route sync, must leave a live project's route
+in place, and must leave a byte-identical salvage copy. Every one of these was
+confirmed to fail against the unfixed daemon.
+
+Two test-hygiene bugs surfaced while doing it, both fixed:
+
+- **The suite leaked its fake project servers on exit.** The exit trap killed the
+  daemon and the fake Caddy but not the `python3 -m http.server` processes the
+  fake `systemctl` really starts. One per run survived, so after enough runs the
+  whole 4500-4600 range was occupied and every later run failed with `no free
+  port` — dozens of failures that had nothing to do with the code under test.
+  The trap now stops them, matching only servers serving out of this run's own
+  directory. Three consecutive runs now leave nothing behind.
+- **A first draft of the new route assertion passed vacuously.** It compared the
+  route set before and after the corruption, but at that point in the suite no pm
+  route existed to lose, so it also passed against the unfixed daemon. It now
+  creates a project first and asserts that project's route specifically survives.
+
+Deploying v0.2.5 caught a regression in the fix above before it shipped anywhere:
+`deleteProject` set `purged = false` on the refusal branch but never set it back
+to `true` on the success branch, so a perfectly legitimate purge reported
+`purged: false` even though it had removed the files. The `purge=1` verification
+step caught it on the live install, not the test suite — and the reason the suite
+had missed it is the same trap as above: the new test asserted only the refusal
+case, so a deleteProject that removed nothing passed it. There is now a
+symmetric assertion that a legitimate purge reports `purged: true` and really
+removes the directory, confirmed to fail against the broken version.
+
+`caddy-config-test.sh` unchanged at 7.
+
 ## [0.2.4] — 2026-10-06
 
 Final release before v1.0.0. Two installer/test defects found by deploying

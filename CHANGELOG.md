@@ -454,6 +454,24 @@ already present.
 - Full stack still green on the production host: 14 passed / 0 warn / 0 failed,
   HTTPS 200.
 
+## [0.1.1-pm] — 2026-10-05
+
+Tag `v0.1.1-pm`. The pm-only bug-fix release, shipped alongside `[0.1.1]` before
+the two installers were unified. Four bugs found by live validation:
+
+- Project creation reported success before the unit was actually running, so a
+  failed `systemctl enable --now` still returned `httpsReady: true`.
+- The Caddy route was published before the project answered on its port.
+- A failed create left the unit file, the project directory and the Caddy route
+  behind instead of unwinding.
+- `PM_FALLBACK_ASKS` went stale on re-install, because `enable --now` is a no-op
+  on an already-active unit, silently ignoring a changed `Environment=`. The
+  installer now always restarts the unit.
+
+The first three are covered by the atomic-rollback assertions in `local-test.sh`
+(`create: atomic rollback when a step fails`); the fourth is why the installer
+restarts rather than enables.
+
 ## [0.1.1] — 2026-10-05 (final)
 
 Fixes a verification timing bug found on a host with a pre-existing on-demand
@@ -529,6 +547,28 @@ Added README sections for on-demand TLS (including the external dependency, the
 `ask` diagnostic and its response codes, and the three options) and for
 Diagnostics (log tailing, HTTP→HTTPS redirect check, TLS handshake check,
 certificate dates, and symptom-to-cause table).
+
+## [0.1.0-pm] — 2026-10-05
+
+Tag `v0.1.0-pm`. First release of the Project Manager as a standalone component,
+before it was folded into the single installer of `[0.2.0]`.
+
+### Added
+
+- **`pmd`, a root daemon on `127.0.0.1`** with a bearer-token API: create, list,
+  status, start, stop, restart, delete, logs. State in `state.json`, written
+  atomically.
+- **One systemd unit per project**, running as the unprivileged `pm` user and
+  bound to loopback, so project code never runs as root.
+- **Caddy `on_demand_tls` gate.** `pmd` becomes the authorization endpoint, so a
+  name it does not own never gets a certificate — this is what protects the
+  Let's Encrypt quota. A pre-existing gate is recovered and delegated to, so
+  other sites keep working.
+- **pm MCP server**, exposing `pm_create`, `pm_list`, `pm_status`, `pm_start`,
+  `pm_stop`, `pm_restart`, `pm_delete`, `pm_logs` over stdio, registered into
+  `opencode.json`.
+- **Atomic rollback on create**: any failed step unwinds the unit, the directory,
+  the state entry and the route.
 
 ## [0.1.0] — 2026-10-05
 

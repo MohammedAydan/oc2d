@@ -1,5 +1,7 @@
 # oc2d — Vibecoding Platform installer
 
+**Stable release: v1.0.0** (pm daemon: v0.2.5). MIT licensed.
+
 One command installs **OpenCode 2** behind **HTTPS via Caddy** and the **Project
 Manager (pm)**, then wires pm into OpenCode as an MCP server. After that, the
 agent inside the OpenCode chat can create and manage sites on subdomains of
@@ -49,6 +51,34 @@ installer tells it to authorize the OpenCode site itself as well.
 
 Run as your **normal user**, not root — the OpenCode service must read your own
 config and credentials.
+
+## DNS setup
+
+Exactly two records are needed. Both must point at this host's **public** IP,
+and ports 80 and 443 must be reachable from the internet, because Let's Encrypt
+validates over the public internet.
+
+| Type | Name | Value |
+|------|------|-------|
+| `A` | `example.com` | this host's public IP |
+| `A` | `*.example.com` | this host's public IP |
+
+Where `example.com` is your parent domain — the domain under which pm may expose
+`blog.example.com`, `api.example.com`, and so on.
+
+Check before installing:
+
+```bash
+dig +short example.com A
+dig +short blog.example.com A     # the wildcard must answer for any name
+```
+
+If the wildcard is missing, every new project will be created but fail its HTTPS
+readiness check, and pm's create call will roll the project back. The installer
+verifies this itself and refuses to continue with the records to add if it does
+not match, so you can also just run it and read the error.
+
+---
 
 ## Flags
 
@@ -313,6 +343,38 @@ expiry.
   typed. Both scripts warn if your password contains either.
 - The unit uses systemd's `%h`, so nothing is hardcoded to `/home/<user>`.
 
+### Accepted risks
+
+These are deliberate. Each is listed with what it would take to close it, so the
+trade-off is visible rather than implied.
+
+1. **`PM_TOKEN` reaches the MCP server through its environment.** A process
+   running as the same user can read it from `/proc/<pid>/environ`. This is how
+   MCP stdio servers receive configuration; there is no handshake that avoids it.
+   To close it, hand the token to the MCP server on a file descriptor it opens
+   itself, which would mean replacing stdio configuration.
+2. **`/health` needs no token** and returns the parent domain and the project
+   count. The daemon binds `127.0.0.1`, so this is only visible to processes on
+   the host, and a project count is not sensitive. To close it, require the token
+   — but Caddy and monitoring would then need credentials.
+3. **A project unit is lightly sandboxed.** `NoNewPrivileges=true` and the
+   process runs as the unprivileged `pm` user, but there is no `ProtectSystem` or
+   `PrivateTmp`, so a project can read and write anything the `pm` user can —
+   which is everything under `/srv/pm`. To close it, add the systemd sandbox
+   directives; this was considered and deferred as a feature rather than a fix,
+   because it can break legitimate projects that need to write elsewhere.
+4. **A project is arbitrary code from the chat.** Whoever can use the OpenCode UI
+   can have the agent create a project, and that project runs as `pm` on a public
+   subdomain. This is the product's purpose, not a defect; the containment
+   boundary is the `pm` user, not a container.
+5. **The installer fetches and runs the official OpenCode installer** over the
+   network. To close it, vendor and pin a checksum, at the cost of tracking
+   upstream releases manually.
+6. **`pmd` runs as root**, because it must drive `systemctl` and write
+   `/etc/systemd/system`. Project code never does. Splitting the privileged
+   control plane from the serving path would remove the need, but would also
+   split pm into two services.
+
 ## Uninstall
 
 ```bash
@@ -520,6 +582,8 @@ MCP servers, not a guess from the config file.
 
 ## Troubleshooting
 
+Start with the logs:
+
 ```bash
 journalctl --user -u opencode.service -n 50 --no-pager
 sudo journalctl -u caddy -n 50 --no-pager
@@ -527,6 +591,80 @@ sudo journalctl -u pmd -n 50 --no-pager      # when pm is installed
 sudo caddy validate --config /etc/caddy/Caddyfile
 ls -1 /etc/caddy/Caddyfile.bak.*        # merge backups
 ```
+
+### The ten failure modes worth knowing
+
+1. **The project is created, then immediately rolled back, with a port error.**
+   Ports 80 and 443 are not reachable from the internet, so Let's Encrypt cannot
+   validate. Fix: open both in the firewall and at the security group. Confirm
+   with `curl -s -o /dev/null -w '%{http_code}\n' http://<subdomain>` from another
+   network.
+
+2. **`pm_create` fails and the subdomain stays 404.** The TLS gate refused the
+   name. Ask it directly:
+   `curl -s "http://127.0.0.1:8300/internal/check-domain?domain=<sub>"`.
+   A `403` means pm does not own that name — it must be under the parent, or
+   listed with `--allow-domain`.
+
+3. **A subdomain returns 404 but the project is listed.** Its route was released
+   because the project is no longer in `state.json`, or the unit is missing. pm
+   logs `dropping "<name>" — …` at startup; that line names the reason.
+
+4. **The OpenCode site lost TLS after an installer re-run.** The allowlist that
+   authorizes the apex was emptied. It is now merged across runs, but if you ever
+   see it, re-run with `--allow-domain example.com` and check
+   `sudo grep PM_ALLOW_DOMAINS /etc/systemd/system/pmd.service`.
+
+5. **Every project 404s after a restart, with no pm error.** `state.json` could
+   not be read. pm now says so explicitly and refuses to sync routes; the damaged
+   file is kept as `state.json.unreadable.<timestamp>` next to it. Repair the
+   permissions, then restart.
+
+6. **A project exists on disk but pm does not list it.** Its `state.json` entry
+   was dropped for a stale path or subdomain, or its unit file is gone. Restore
+   the unit, or recreate the project.
+
+7. **The agent says `pm is not configured`.** `PM_TOKEN` is empty in
+   `opencode.json`. Re-run `install-pm.sh`; it rewrites the `mcp.pm` entry with
+   the current token.
+
+8. **`systemctl --user` fails with "Interactive authentication required".**
+   Linger is off, so there is no user session bus. Fix:
+   `sudo loginctl enable-linger "$USER"`, then log out and back in.
+
+9. **Caddy refuses to start after an install.** The installer validates before
+   reloading and restores automatically, so this means something outside the
+   installer edited the Caddyfile. Restore the newest backup:
+   `sudo cp /etc/caddy/Caddyfile.bak.<timestamp> /etc/caddy/Caddyfile && sudo systemctl reload caddy`.
+
+10. **`pm_create` answers `no free port in 4096-5000`.** Every port in the range
+    is in use, usually by a leftover process. Find them with
+    `sudo ss -ltnp | grep -E ':(409[6-9]|[45][0-9]{3})'`, or widen the range with
+    `PM_PORT_RANGE` in the unit.
+
+### Rollback
+
+Both installers are idempotent and re-runnable, so the first response to a bad
+upgrade is to re-run the previous release over the top. If a re-run is not
+possible, restore from the backups the installer left behind:
+
+```bash
+TS=<timestamp of the backup>
+sudo systemctl stop pmd.service
+sudo rm -rf /opt/pm
+sudo cp -r /opt/pm.pre-v02$TS /opt/pm
+sudo cp /var/lib/pm/state.json.pre-v02$TS /var/lib/pm/state.json
+sudo cp /etc/caddy/Caddyfile.pre-v02$TS /etc/caddy/Caddyfile
+sudo systemctl daemon-reload
+sudo systemctl start pmd.service
+sudo systemctl reload caddy
+curl -s -o /dev/null -w '%{http_code}\n' https://example.com/    # expect 200
+```
+
+The files are named `.pre-v023-<ts>`, `.pre-v024-<ts>` and `.pre-v025-<ts>` for
+the releases that took them; `ls -1 /opt/pm.pre-v02* /var/lib/pm/*.pre-v02*` shows
+what is available. Then verify the pre-existing projects still answer over HTTPS
+before declaring the rollback good.
 
 ## Repository layout
 

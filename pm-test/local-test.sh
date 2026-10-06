@@ -283,7 +283,7 @@ assert_eq "pre-existing route still preserved" 1 "$(routes_of | grep -c somebody
 
 # --------------------------------------------------------------- mcp server
 section "MCP server (stdio)"
-node "$HERE/mcp-client.js" "$PM/mcp/index.js" "$TOKEN" "$API" >"$WORK/logs/mcp.log" 2>&1
+PM_MOCK_TEST=1 node "$HERE/mcp-client.js" "$PM/mcp/index.js" "$TOKEN" "$API" >"$WORK/logs/mcp.log" 2>&1
 MCP_RC=$?
 if [ "$MCP_RC" -eq 0 ]; then
 	while IFS= read -r line; do

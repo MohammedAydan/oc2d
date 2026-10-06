@@ -2,6 +2,52 @@
 
 All notable changes to this project are documented here.
 
+## [0.2.4] — 2026-10-06
+
+Final release before v1.0.0. Two installer/test defects found by deploying
+v0.2.3 to production, one of which could have taken the platform's own site
+offline.
+
+### Fixed
+
+- **`install-pm.sh` erased `PM_ALLOW_DOMAINS` on every re-run.** The unit was
+  written with `Environment="PM_ALLOW_DOMAINS=$ALLOW_DOMAINS"`, taken straight
+  from the `--allow-domain` flag, with no recovery from the installed unit — even
+  though `PM_FALLBACK_ASKS` has exactly that recovery a few lines earlier. So
+  `install-pm.sh --domain D --parent D` on an existing install emptied the
+  allowlist. `checkDomain` tests the allowlist *before* it refuses the apex as a
+  reserved name, so the apex then failed the gate, Caddy stopped renewing that
+  certificate, and the OpenCode site lost TLS. The value the caller passed is now
+  merged with whatever the installed unit already carries, read from the running
+  unit and, if systemd reports nothing, from the unit file being overwritten.
+  Neither a plain re-run nor an unrelated `--allow-domain` can drop a host that
+  is already trusted.
+- **`pm-test/mcp-client.js` asserted a fixture name that only exists in the mock
+  suite.** `pm_list` was checked with `/blog/.test(...)`, so the check failed
+  against a real install, whose projects are named differently. The check now
+  proves what it can actually prove — that the call reached the daemon and
+  rendered a status per project — and asserts the `blog` fixture only when
+  `PM_MOCK_TEST=1`, which `local-test.sh` now sets.
+
+### Notes
+
+- The merge pipeline ends in `grep -v '^$' | sort -u | paste`. Under
+  `set -o pipefail`, `grep` exits 1 when it filters out *everything*, which is
+  exactly the both-sources-empty case of a first install. Without the `|| true`
+  now on that pipeline, a fresh install would have aborted. Caught before
+  deployment by exercising the merge directly rather than only on production.
+- Deployed and verified against a live install: 2 projects preserved
+  byte-identically, apex/wildcard/empty subdomains rejected, a legitimate
+  subdomain still reaching HTTPS 200, OpenCode UI unaffected.
+
+### Tests
+
+`local-test.sh` 112 → **114** (the `pm_list` check split into environment-
+agnostic and mock-only assertions). `caddy-config-test.sh` unchanged at 7. The
+`PM_ALLOW_DOMAINS` merge is exercised directly, all seven cases: first install,
+re-run without the flag, re-run with it, adding a second domain, deduplication,
+stray whitespace, and flag-before-first-install.
+
 ## [0.2.3] — 2026-10-06
 
 Restricts what a pm project may claim. A subdomain becomes a Caddy `host`

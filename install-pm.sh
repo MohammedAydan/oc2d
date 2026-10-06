@@ -269,6 +269,31 @@ if [ -z "$OLD_ASKS" ] && systemctl is-active --quiet "$UNIT_NAME"; then
 	fi
 fi
 
+# PM_ALLOW_DOMAINS names the hosts pmd must authorise even though they are not pm
+# projects — here, the OpenCode site that answers on the apex. checkDomain tests
+# that list BEFORE it refuses the apex as a reserved name, so an empty list makes
+# the apex fail the gate, Caddy stops renewing that certificate, and the
+# platform's own site loses TLS. This value was written straight from the flag,
+# so a re-run that forgot --allow-domain silently emptied it. Merge whatever the
+# caller passed with whatever the installed unit already carries, so neither a
+# plain re-run nor an unrelated --allow-domain can drop a host already trusted.
+# `|| true` matters: under pipefail the `grep -v` exits 1 when it filters out
+# everything, which is exactly the both-empty case of a first install.
+EXISTING_ALLOW=""
+if systemctl is-active --quiet "$UNIT_NAME"; then
+	EXISTING_ALLOW="$(systemctl show "$UNIT_NAME" -p Environment --value 2>/dev/null |
+		sed -n 's/.*PM_ALLOW_DOMAINS=\([^ ]*\).*/\1/p')"
+fi
+# The unit file is the thing being overwritten, so it is the authority when
+# systemd has nothing to report (e.g. the service failed to start last time).
+if [ -z "$EXISTING_ALLOW" ] && [ -f "/etc/systemd/system/$UNIT_NAME" ]; then
+	EXISTING_ALLOW="$(sed -n 's/.*PM_ALLOW_DOMAINS=\([^"]*\)".*/\1/p' \
+		"/etc/systemd/system/$UNIT_NAME")"
+fi
+MERGED_ALLOW="$(printf '%s,%s\n' "$ALLOW_DOMAINS" "$EXISTING_ALLOW" |
+	tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' |
+	grep -v '^$' | sort -u | paste -sd, - || true)"
+
 # The wildcard site block. Real upstreams are injected through Caddy's admin API
 # per project; this block only serves the TLS policy and a sane 404 fallback.
 #
@@ -332,11 +357,16 @@ Environment="PM_STATE=/var/lib/pm/state.json"
 Environment="PM_PORT_RANGE=4096-5000"
 Environment="PM_RUN_USER=pm"
 Environment="PM_FALLBACK_ASKS=$OLD_ASKS"
-Environment="PM_ALLOW_DOMAINS=$ALLOW_DOMAINS"
+Environment="PM_ALLOW_DOMAINS=$MERGED_ALLOW"
 
 [Install]
 WantedBy=multi-user.target
 UNIT
+if [ -n "$EXISTING_ALLOW" ]; then
+	ok "allowlist: $MERGED_ALLOW (recovered: $EXISTING_ALLOW)"
+else
+	ok "allowlist: ${MERGED_ALLOW:-<empty>}"
+fi
 systemctl daemon-reload
 systemctl enable "$UNIT_NAME" >/dev/null
 # `enable --now` is a NO-OP when the unit is already active, so a re-install

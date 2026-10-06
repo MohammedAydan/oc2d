@@ -65,8 +65,20 @@ const check = (ok, label, detail) => results.push(`${ok ? 'OK' : 'FAIL'} ${label
 
   const listed = await send('tools/call', { name: 'pm_list', arguments: {} });
   const listText = listed.content[0].text;
-  check(!listed.isError && /blog/.test(listText), 'pm_list reaches the daemon and finds the live project',
-    listText.slice(0, 120));
+  // Environment-agnostic: the daemon may hold any projects (or none). What is
+  // being proven is that the call reached the daemon and rendered its state, not
+  // that a fixture named "blog" exists — a real install has different names, and
+  // asserting one made this check fail against production.
+  check(!listed.isError && listText.length > 0,
+    'pm_list reaches the daemon and returns its projects', listText.slice(0, 120));
+  check(/running|stopped/.test(listText),
+    'pm_list renders a status per project', listText.slice(0, 120));
+  // Only the mock suite can know its own fixture name, so ask for that name
+  // explicitly rather than assuming it.
+  if (process.env.PM_MOCK_TEST === '1') {
+    check(/\bblog\b/.test(listText),
+      'pm_list finds the mock fixture project', listText.slice(0, 120));
+  }
 
   const bad = await send('tools/call', { name: 'pm_status', arguments: { name: 'does-not-exist' } });
   check(bad.isError === true && /no such project/.test(bad.content[0].text),

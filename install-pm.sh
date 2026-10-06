@@ -7,6 +7,10 @@ DOMAIN="" PARENT="" SKIP_DNS=0
 PREFIX="# pm-managed"
 UNIT_NAME="pmd.service"
 CADDYFILE="/etc/caddy/Caddyfile"
+SKIP_SMOKE=0            # set by --skip-smoke, or when embedded in install-opencode.sh
+DO_UNINSTALL=0
+PURGE=0
+ALLOW_DOMAINS=""        # extra hostnames pmd must authorize (comma-separated)
 
 say()  { printf '\033[1;36m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m warn:\033[0m %s\n' "$*" >&2; }
@@ -15,12 +19,19 @@ ok()   { printf '  \033[1;32m✓\033[0m %s\n' "$*"; }
 
 usage() {
 	cat <<EOF
-Usage: install-pm.sh --domain <domain> [--parent <domain>] [--skip-dns-check]
+Usage: install-pm.sh --domain <domain> [--parent <domain>] [--skip-dns-check] [--skip-smoke]
 
   --domain <d>       Domain to serve. The parent is its last two labels
                      (blog.example.com -> example.com) unless --parent is given.
   --parent <d>       Parent domain whose wildcard subdomains pm may expose.
   --skip-dns-check   Don't verify the wildcard A record.
+  --skip-smoke       Don't create/verify/delete the smoke project.
+  --allow-domain <d> Extra hostname pmd must authorize even though it is not a
+                     pm project (repeatable, comma-separated). pmd is the whole
+                     on_demand_tls gate once installed, so anything else needing
+                     a certificate must be listed here.
+  --uninstall        Remove the pm daemon, its files and the MCP entry.
+  --purge            With --uninstall, also delete /var/lib/pm and /srv/pm.
   -h, --help         This text.
 
 Requires root. Idempotent: safe to re-run.
@@ -32,12 +43,90 @@ while [ $# -gt 0 ]; do
 		--domain)         DOMAIN="${2:-}"; shift 2 ;;
 		--parent)         PARENT="${2:-}"; shift 2 ;;
 		--skip-dns-check) SKIP_DNS=1; shift ;;
+		--skip-smoke)     SKIP_SMOKE=1; shift ;;
+		--allow-domain)   ALLOW_DOMAINS="${ALLOW_DOMAINS:+$ALLOW_DOMAINS,}${2:-}"; shift 2 ;;
+		--uninstall)      DO_UNINSTALL=1; shift ;;
+		--purge)          PURGE=1; shift ;;
 		-h|--help)        usage; exit 0 ;;
 		*)                usage >&2; die "unknown argument: $1" ;;
 	esac
 done
 
 [ "$(id -u)" -eq 0 ] || die "run as root (sudo ./install-pm.sh --domain example.com)"
+
+# Uninstall needs no --domain: remove by whatever is on disk.
+if [ "$DO_UNINSTALL" -eq 1 ]; then
+	OWNER="${SUDO_USER:-root}"
+	OWNER_GRP="$(id -gn "$OWNER" 2>/dev/null || echo root)"
+	TARGET_HOME="$(getent passwd "$OWNER" | cut -d: -f6)"
+	TARGET_HOME="${TARGET_HOME:-$HOME}"
+	CONF="$TARGET_HOME/.config/opencode/opencode.json"
+
+	say "Removing the pm daemon"
+	systemctl stop "$UNIT_NAME" 2>/dev/null || true
+	systemctl disable "$UNIT_NAME" 2>/dev/null || true
+	rm -f "/etc/systemd/system/${UNIT_NAME}"
+	systemctl daemon-reload || true
+	systemctl reset-failed "$UNIT_NAME" 2>/dev/null || true
+	ok "pmd.service stopped and removed"
+
+	# Stop every project unit before deleting their state, so nothing is left
+	# running against files that are about to disappear.
+	if [ -s /var/lib/pm/state.json ]; then
+		jq -r '.projects[]?.name' /var/lib/pm/state.json 2>/dev/null | while read -r n; do
+			[ -n "$n" ] && systemctl disable --now "pm-${n}.service" >/dev/null 2>&1 || true
+			rm -f "/etc/systemd/system/pm-${n}.service"
+		done
+		systemctl daemon-reload || true
+		ok "project units stopped and removed"
+	fi
+
+	# Drop the MCP entry, leaving every other server in the file untouched.
+	if [ -f "$CONF" ]; then
+		tmp="$(mktemp)"; chmod 0600 "$tmp"
+		if jq 'del(.mcp.pm)' "$CONF" > "$tmp" 2>/dev/null; then
+			install -m 0600 -o "$OWNER" -g "$OWNER_GRP" "$tmp" "$CONF"
+			ok "pm entry removed from $CONF"
+		else
+			warn "could not parse $CONF; left unchanged"
+		fi
+		rm -f "$tmp"
+	fi
+
+	# Restore the on_demand_tls ask endpoint pm replaced, if we recorded it.
+	if [ -s /var/lib/pm/previous-ask ] && [ -f "$CADDYFILE" ]; then
+		PREV="$(head -1 /var/lib/pm/previous-ask)"
+		if [ -n "$PREV" ]; then
+			cp -a "$CADDYFILE" "$CADDYFILE.bak.$(date +%Y%m%d-%H%M%S)"
+			sed -i -E "s#^([[:space:]]*ask[[:space:]]+)http://127\\.0\\.0\\.1:8300/internal/check-domain#\\1$PREV#" "$CADDYFILE"
+			if caddy validate --adapter caddyfile --config "$CADDYFILE" >/dev/null 2>&1; then
+				systemctl reload caddy || true
+				ok "restored the previous on_demand_tls ask endpoint: $PREV"
+			else
+				warn "revert would not validate; left $CADDYFILE alone (backup kept)"
+			fi
+		fi
+	fi
+
+	# The pm-managed wildcard site block, if we added it.
+	if [ -f "$CADDYFILE" ] && grep -q "$PREFIX" "$CADDYFILE" && [ -n "$PARENT" ]; then
+		say "Note: the '$PREFIX' block for *.$PARENT is left in $CADDYFILE;"
+		say "      remove it by hand if you no longer want pm."
+	fi
+
+	rm -rf /opt/pm /etc/pm
+	if [ "$PURGE" -eq 1 ]; then
+		rm -rf /var/lib/pm /srv/pm
+		ok "/opt/pm, /etc/pm, /var/lib/pm and /srv/pm removed"
+	else
+		rm -f /var/lib/pm/previous-ask
+		printf 'Project data kept (/var/lib/pm, /srv/pm). Add --purge to delete it too.\n'
+	fi
+	ok "pm uninstalled. Caddy was left installed."
+	systemctl --user restart opencode.service 2>/dev/null || true
+	exit 0
+fi
+
 [ -n "$DOMAIN" ] || { usage >&2; die "--domain is required"; }
 
 DOMAIN="${DOMAIN,,}"
@@ -141,6 +230,16 @@ OLD_ASKS="$(grep -E '^[[:space:]]*ask[[:space:]]' "$CADDYFILE" 2>/dev/null |
 	sed -E 's#^[[:space:]]*ask[[:space:]]+##; s#[{].*##' | grep -v "$ASK_URL" | paste -sd, - || true)"
 
 if grep -qE '^[[:space:]]*on_demand_tls' "$CADDYFILE"; then
+	# Record what pm takes over, so --uninstall can hand the endpoint back.
+	CUR="$(grep -E '^[[:space:]]*ask[[:space:]]' "$CADDYFILE" | head -1 |
+		sed -E 's#^[[:space:]]*ask[[:space:]]+##; s#[{].*##' || true)"
+	if [ -n "$CUR" ] && [ "$CUR" != "$ASK_URL" ]; then
+		# Keep it on disk for --uninstall, and also print it: if this file is ever
+		# lost, the operator still knows what to put back.
+		install -d -m 0750 /var/lib/pm
+		printf '%s\n' "$CUR" > /var/lib/pm/previous-ask
+		say "noted the previous on_demand_tls gate: $CUR (--uninstall restores it)"
+	fi
 	sed -i -E "s#^([[:space:]]*ask[[:space:]]+).*#\\1$ASK_URL#" "$CADDYFILE"
 	ok "repointed existing on_demand_tls ask -> $ASK_URL"
 else
@@ -208,6 +307,7 @@ Environment="PM_STATE=/var/lib/pm/state.json"
 Environment="PM_PORT_RANGE=4096-5000"
 Environment="PM_RUN_USER=pm"
 Environment="PM_FALLBACK_ASKS=$OLD_ASKS"
+Environment="PM_ALLOW_DOMAINS=$ALLOW_DOMAINS"
 
 [Install]
 WantedBy=multi-user.target
@@ -258,8 +358,8 @@ rm -f "$tmp"
 ok "$CONF (mcp.pm)"
 
 # ------------------------------------------------------------- 9. smoke test
-if [ "${PM_SKIP_SMOKE:-0}" = "1" ]; then
-	say "Skipping smoke test (PM_SKIP_SMOKE=1)"
+if [ "$SKIP_SMOKE" -eq 1 ]; then
+	say "Skipping smoke test (--skip-smoke)"
 else
 	say "Smoke test: creating 'smoke' project on smoke.$PARENT"
 	CREATE_OUT="$(curl -fsS -m 180 -X POST http://127.0.0.1:8300/projects \

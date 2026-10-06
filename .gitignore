@@ -1,2 +1,5 @@
-*.bak
-*.bak.*
+# Ignore the combined test scratch dirs and node deps (moved from pm/.gitignore)
+node_modules/
+package-lock.json
+pm-test/.work/
+pm-test/.e2e/

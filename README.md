@@ -1,12 +1,41 @@
-# oc2d — OpenCode 2 + Caddy installer
+# oc2d — Vibecoding Platform installer
 
-Installs the official **OpenCode 2** CLI and serves it over **HTTPS via Caddy**
-as persistent, auto-restarting systemd services. Built to run once on a messy
-host and survive reboots, crashes and re-runs without intervention.
+One command installs **OpenCode 2** behind **HTTPS via Caddy** and the **Project
+Manager (pm)**, then wires pm into OpenCode as an MCP server. After that, the
+agent inside the OpenCode chat can create and manage sites on subdomains of
+your parent domain, each with its own valid certificate.
 
 ```bash
 ./install-opencode.sh --domain example.com
 ```
+
+Then open `https://example.com`, log in, and type:
+
+```
+Create a project called blog at blog.example.com
+```
+
+There is no separate dashboard. OpenCode's built-in web UI *is* the interface;
+the `pm_*` tools are how the agent gets that power.
+
+## How the two halves fit
+
+```
+OpenCode 2 (web UI, the interface you use)
+   │  MCP over stdio
+   ▼
+pm MCP server  ──HTTP──▶  pm daemon (pmd)
+                             │
+             ┌───────────────┴───────────────┐
+             ▼                               ▼
+     systemd unit per project        Caddy on_demand_tls gate
+     (unprivileged user `pm`)        (issues one cert per subdomain)
+```
+
+`pmd` is also Caddy's TLS authorization gate. Caddy will not issue a
+certificate for a name the gate refuses, which is what stops a stranger from
+burning your Let's Encrypt quota. Because that makes pm the *whole* gate, the
+installer tells it to authorize the OpenCode site itself as well.
 
 ## Requirements
 
@@ -33,11 +62,51 @@ config and credentials.
 | `--skip-dns-check` | off | Proceed even if the A record doesn't point here |
 | `--upgrade` | off | Reinstall OpenCode even if already current |
 | `--strict-port` | off | Abort on a busy port instead of auto-shifting |
+| `--with-pm` | auto | Always install pm, never prompt |
+| `--without-pm` | auto | Never install pm |
+| `--pm-parent <d>` | last two labels of `--domain` | Parent domain pm may expose subdomains under |
+| `--skip-pm-smoke` | off | Let pm skip its own smoke test; the combined one still runs |
 | `--uninstall` | | Remove the user unit and the domain's Caddy block |
 | `--purge` | | With `--uninstall`, also delete the binary and password |
 | `-h`, `--help` | | Usage |
 
 Env: `OPENCODE_PASSWORD` sets the password when no password flag is given.
+
+## Project Manager (pm)
+
+You are asked once whether to install pm, unless `--with-pm` / `--without-pm`
+says so. If `pmd.service` already exists it is re-verified, never reinstalled.
+
+pm manages a **parent domain** — `--domain blog.example.com` implies the parent
+`example.com` — and hands out subdomains of it. That needs a wildcard DNS record:
+
+```
+A    example.com     -> this server
+A    *.example.com   -> this server
+```
+
+Pass `--pm-parent` when the parent is not the last two labels of `--domain`.
+
+| Tool the agent can call | Effect |
+|---|---|
+| `pm_create({name, subdomain?})` | scaffold, start, route, wait for HTTPS |
+| `pm_list()` | every project with status, port, subdomain |
+| `pm_status({name})` | one project's state |
+| `pm_start` / `pm_stop` / `pm_restart` | control a project |
+| `pm_delete({name, purge?})` | remove unit + route; `purge` deletes files |
+| `pm_logs({name, lines?})` | recent journal output |
+
+### Try these in the OpenCode chat
+
+```
+Create a static site called portfolio at portfolio.example.com
+List all my projects
+Stop the blog project
+Delete the demo project and clean up its files
+```
+
+Each project becomes a systemd service running as the unprivileged `pm` user,
+bound to loopback, reachable only through its subdomain.
 
 ## Password
 
@@ -221,9 +290,17 @@ expiry.
 ## Uninstall
 
 ```bash
-./install-opencode.sh --uninstall          # unit + this domain's Caddy block
-./install-opencode.sh --uninstall --purge  # also the binary and password
+./install-opencode.sh --uninstall                # unit + this domain's Caddy block
+./install-opencode.sh --uninstall --purge        # also the binary and password
+./install-opencode.sh --uninstall --with-pm      # also removes pm entirely
+./install-opencode.sh --uninstall --with-pm --purge   # and all project data
 ```
+
+Uninstalling with pm removes `pmd.service` and every project unit, deletes the
+`pm` entry from `opencode.json` while leaving any other MCP server intact, and
+**restores the `on_demand_tls` gate that pm took over** — so a pre-existing
+installation that was sharing the gate keeps working. Project files and
+`state.json` survive unless you add `--purge`.
 
 Caddy itself is left installed, since other sites may depend on it. Linger is
 left enabled; remove it with `sudo loginctl disable-linger "$USER"`. `--purge`
@@ -393,13 +470,47 @@ Interpreting the common outcomes:
 | `308` to HTTPS on port 80 | Correct; the redirect is working |
 | `Cannot complete TLS handshake` | Certificate still provisioning, or no certificate issued |
 
+### pm and MCP
+
+| Symptom | Likely cause |
+|---|---|
+| Agent says it has no `pm_*` tools | The MCP entry is missing or OpenCode never restarted |
+| `pm_create` fails with "port did not answer" | The project's unit failed to start — `pm_logs({name})` |
+| A subdomain 404s with "no project assigned" | In `state.json` but its Caddy route is gone; `sudo systemctl restart pmd` rebuilds all routes |
+| HTTPS fails on the OpenCode site after installing pm | The gate stopped authorizing it; check `PM_ALLOW_DOMAINS` in `pmd.service` |
+| `TLS gate refuses <your domain>` | `pmd` owns `on_demand_tls` and was not told about your site — reinstall with `--with-pm` |
+
+Verify the wiring yourself:
+
+```bash
+jq '.mcp.pm' ~/.config/opencode/opencode.json      # entry present
+curl -su "opencode:$(cut -d= -f2 ~/.config/opencode/env)" \
+  http://127.0.0.1:4096/api/mcp | jq                # pm status: connected
+curl -s "http://127.0.0.1:8300/internal/check-domain?domain=your.domain"  # 200
+```
+
+The middle one is the authoritative answer: it is OpenCode's own view of its
+MCP servers, not a guess from the config file.
+
 ## Troubleshooting
 
 ```bash
 journalctl --user -u opencode.service -n 50 --no-pager
 sudo journalctl -u caddy -n 50 --no-pager
+sudo journalctl -u pmd -n 50 --no-pager      # when pm is installed
 sudo caddy validate --config /etc/caddy/Caddyfile
 ls -1 /etc/caddy/Caddyfile.bak.*        # merge backups
+```
+
+## Repository layout
+
+```
+install-opencode.sh   the platform installer (this is the entry point)
+install-pm.sh         pm installer, called by the above; also runnable alone
+daemon/               pm daemon (pmd)
+mcp/                  pm MCP server
+pm-test/              pm's test suite (89 + 7 assertions, no root needed)
+pm-test/README.md     pm documentation and design notes
 ```
 
 ## License

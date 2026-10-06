@@ -2,6 +2,67 @@
 
 All notable changes to this project are documented here.
 
+## [0.2.0] — 2026-10-06
+
+Unifies OpenCode 2 and the Project Manager into a single installer. One command
+now produces a complete platform: OpenCode behind HTTPS, the pm daemon, and the
+pm MCP server registered inside OpenCode, so the agent in the chat can create
+and manage sites on subdomains of your parent domain with valid certificates.
+
+### Added
+
+- **Single-command install.** `./install-opencode.sh --domain example.com` now
+  installs both halves. pm is auto-detected: an existing `pmd.service` is
+  re-verified rather than reinstalled, a missing one triggers a one-time prompt,
+  and `--with-pm` / `--without-pm` skip the prompt entirely. With no TTY (CI) the
+  install proceeds, so the platform is never silently incomplete.
+- **`--pm-parent <d>`** for when the parent is not the last two labels of
+  `--domain`, plus `--skip-pm-smoke` to let pm skip its own smoke test.
+- **MCP verification against OpenCode's own API.** After writing the config the
+  installer restarts OpenCode and polls `/api/mcp` until it reports the `pm`
+  server as `connected`. A config file that is merely well-formed no longer counts
+  as proof.
+- **Combined smoke test**: pmd active and boot-enabled, daemon healthy, MCP entry
+  present and connected, the TLS gate authorizing the OpenCode domain, a real
+  project created over HTTPS and then removed, and OpenCode still serving.
+- **`--uninstall --with-pm`** removes pm as well: stops and deletes `pmd.service`
+  and every project unit, drops the `pm` entry from `opencode.json` while leaving
+  other MCP servers intact, and **restores the `on_demand_tls` gate pm took
+  over**. `--purge` additionally removes `/opt/pm`, `/etc/pm`, `/var/lib/pm` and
+  `/srv/pm`.
+- **`--allow-domain` on `install-pm.sh`**, used by the unified installer.
+- **Unified summary** naming both components and the demo prompts to try.
+- `pm-test/` — pm's suite, now 89 + 7 assertions.
+
+### Fixed
+
+- **pm's gate no longer breaks the OpenCode site.** pmd becomes Caddy's single
+  `on_demand_tls` authorization gate, so the OpenCode domain — not a pm project —
+  would be refused and its certificate would stop issuing. pm is now told to
+  authorize it, and the combined verification fails loudly with the exact fix if
+  that gate ever stops matching.
+- **A refusing gate can no longer be silently ignored.** The installer previously
+  mirrored an existing on-demand wildcard policy without checking whether the
+  gate would actually issue for the new domain; it now probes the `ask` endpoint
+  and refuses to continue on a policy conflict, explaining both remedies. A
+  disagreement between an exact block and a matching wildcard block is what causes
+  `tlsv1 alert internal error`.
+- **Stale projects are reconciled at daemon start.** An interrupted uninstall, or
+  a hand-deleted unit, left `state.json` describing projects that could never
+  start; they kept their subdomain and Caddy route. `pmd` now drops such entries
+  on boot and releases their routes. Files are left for manual recovery.
+- The `pm` MCP entry is verified through OpenCode's API rather than assumed from
+  the config file, and a `jq` quoting mistake that made every install report a
+  false "MCP not connected" is fixed.
+
+### Changed
+
+- Repository layout: `install-pm.sh`, `daemon/` and `mcp/` moved from `pm/` to the
+  repository root, so the two halves are one product. `pm/` docs moved to
+  `pm-test/README.md`.
+- README rewritten around the unified flow, with the demo prompt set and an
+  MCP troubleshooting section.
+
 ## [0.1.3] — 2026-10-05
 
 Lets the operator choose the OpenCode password at install time, and adds a

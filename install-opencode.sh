@@ -23,6 +23,10 @@ STRICT_PORT=0
 CORS_EXTRA=""
 PW_MODE="auto"        # auto | given | generate; auto prompts only on a TTY
 PW_SOURCE=""          # user | generated | reused — decided once the value is final
+WITH_PM=""            # "" = auto-detect/prompt, "yes" = force, "no" = skip
+PM_PARENT=""          # parent domain pm may expose subdomains under
+PM_SKIP_SMOKE=0       # pm's own smoke test; the combined one still runs
+PM_INSTALLED=0        # set once pm is known to be present and wired
 
 INSTALL_URL="https://opencode.ai/v2/install"      # V2 only; V1 is not wire-compatible
 LATEST_URL="https://opencode.ai/update/api/latest/cli/npm"
@@ -86,9 +90,19 @@ Install OpenCode 2 behind a Caddy reverse proxy with automatic HTTPS.
   --skip-dns-check   Do not verify the A record
   --upgrade          Reinstall OpenCode even if it is already current
   --strict-port      Abort if the port is busy instead of auto-shifting
+  --with-pm          Always install the Project Manager (pm), never prompt
+  --without-pm       Never install pm
+  --pm-parent <d>    Parent domain pm may expose subdomains under
+                     (default: the last two labels of --domain)
+  --skip-pm-smoke    Let pm skip its own smoke test; the combined one still runs
   --uninstall        Remove the OpenCode unit and its Caddy site block
   --purge            With --uninstall, also delete the binary and config
   -h, --help         This message
+
+What you get by default: OpenCode 2 behind HTTPS, plus the Project Manager (pm),
+so the agent inside the chat can create and manage sites on subdomains of your
+parent domain with valid certificates. When pm is already installed it is
+re-verified rather than reinstalled; when it is not, you are asked once.
 
 Password selection, in order of precedence:
   --password <pw>      use it verbatim
@@ -126,6 +140,10 @@ parse_args() {
       --skip-dns-check) SKIP_DNS=1; shift ;;
       --upgrade)   UPGRADE=1; shift ;;
       --strict-port) STRICT_PORT=1; shift ;;
+      --with-pm)  WITH_PM="yes"; shift ;;
+      --without-pm) WITH_PM="no"; shift ;;
+      --pm-parent) PM_PARENT="${2:-}"; shift 2 ;;
+      --skip-pm-smoke) PM_SKIP_SMOKE=1; shift ;;
       --uninstall) DO_UNINSTALL=1; shift ;;
       --purge)     PURGE=1; shift ;;
       -h|--help)   usage; exit 0 ;;
@@ -140,6 +158,11 @@ parse_args() {
   DOMAIN="${DOMAIN%%/*}"
   if ! [[ "$PORT" =~ ^[0-9]+$ ]] || [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
     die "invalid --port: $PORT (expected 1-65535)"
+  fi
+  # pm exposes subdomains of a PARENT; --domain is the OpenCode site itself.
+  # blog.example.com -> example.com.
+  if [ -z "$PM_PARENT" ]; then
+    PM_PARENT="$(printf '%s' "$DOMAIN" | awk -F. '{print $(NF-1)"."$NF}')"
   fi
 }
 
@@ -412,10 +435,41 @@ generate_caddyfile() {
   # matches this domain. If our block claimed plain automatic HTTPS the two would
   # disagree on how TLS is obtained and the handshake fails with an internal
   # error, so mirror the on-demand policy when the file already uses one.
-  local ondemand=""
+  #
+  # But only when the on-demand gate will actually authorize THIS domain. An
+  # on_demand block whose gate answers 403 can never obtain a certificate, so
+  # mirroring the policy there would silently leave the site on plain HTTP. When
+  # pm is installed it authorizes $DOMAIN explicitly; otherwise fall back to
+  # ordinary automatic HTTPS.
+  local ondemand="" ask_endpoint gate_ok=0
   if grep -qE '^[[:space:]]*\*\.' "$CADDYFILE" && grep -q 'on_demand' "$CADDYFILE"; then
-    ondemand=$'\n\ttls {\n\t\ton_demand\n\t}'
-    warn "existing wildcard block uses on-demand TLS; matching that policy"
+    ask_endpoint="$(grep -E '^[[:space:]]*ask[[:space:]]' "$CADDYFILE" | head -1 |
+      sed -E 's#^[[:space:]]*ask[[:space:]]+##; s#[{].*##' || true)"
+    if [ -n "$ask_endpoint" ]; then
+      # No -f here: a 403 is the answer we need, not an error to swallow. -sS
+      # keeps the probe quiet, -o /dev/null discards the body.
+      gate_ok="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
+        "${ask_endpoint}?domain=${DOMAIN}" 2>/dev/null || echo 000)"
+      [ "$gate_ok" = "000" ] && gate_ok=000
+    fi
+    # The wildcard already matches $DOMAIN, so this block MUST use the same TLS
+    # policy or the handshake fails with an internal error. pm is about to be
+    # installed with --allow-domain, which makes the gate authorize $DOMAIN, so
+    # the on-demand policy is the correct choice even before pm is running.
+    if [ "$gate_ok" = "200" ] || [ "$WITH_PM" = "yes" ] || pm_installed; then
+      ondemand=$'\n\ttls {\n\t\ton_demand\n\t}'
+      warn "existing wildcard block uses on-demand TLS; matching that policy"
+    else
+      die "the on-demand TLS gate at ${ask_endpoint:-unknown} refuses $DOMAIN
+    (HTTP ${gate_ok:-000}), but an existing wildcard block already matches
+    $DOMAIN and uses on-demand TLS. Adding a block with a different policy makes
+    the TLS handshake fail with an internal error, so this cannot be installed
+    safely as-is.
+
+    Fix it with either:
+      --with-pm    (pm authorizes $DOMAIN and serves subdomains; recommended)
+      --without-pm and remove or rename the existing '*.' wildcard block in $CADDYFILE"
+    fi
   fi
 
   local block
@@ -686,6 +740,227 @@ start_services() {
   fi
 }
 
+# --- pm (Project Manager) ---------------------------------------------------
+# pm is a separate, already-tested installer living next to this one. We call it
+# rather than inlining it: two focused scripts beat one that does everything, and
+# install-pm.sh stays runnable on its own.
+PM_SCRIPT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)/install-pm.sh"
+PM_UNIT="pmd.service"
+PM_TOKEN_FILE="/etc/pm/token"
+PM_MCP_CONF="${HOME}/.config/opencode/opencode.json"
+
+pm_installed() { as_root systemctl cat "$PM_UNIT" >/dev/null 2>&1; }
+
+pm_health() {
+  local t
+  t="$(as_root cat "$PM_TOKEN_FILE" 2>/dev/null | tr -d '[:space:]')" || return 1
+  [ -n "$t" ] || return 1
+  curl -fsS --max-time 5 -H "Authorization: Bearer $t" http://127.0.0.1:8300/health
+}
+
+# OpenCode2 needs a restart to pick up a changed MCP config, and the MCP server
+# only counts as wired once its own status endpoint says "connected".
+pm_mcp_connected() {
+  local pw body
+  pw="$(sed -n 's/^OPENCODE_PASSWORD=//p' "$ENV_PATH" 2>/dev/null | head -1)"
+  [ -n "$pw" ] || return 1
+  body="$(curl -fsS --max-time 8 -u "${SERVER_USER}:${pw}" \
+    "http://127.0.0.1:${PORT}/api/mcp" 2>/dev/null)" || return 1
+  # -r is required: without it jq prints the string WITH quotes ("connected"),
+  # which never matches `grep -x connected` and reports a false negative.
+  printf '%s' "$body" | jq -r '.data[] | select(.name=="pm") | .status.status' 2>/dev/null \
+    | grep -qx connected
+}
+
+
+# Decide whether pm should be installed, honouring the flags and never prompting
+# twice.
+pm_should_install() {
+  case "$WITH_PM" in
+    no)  return 1 ;;
+    yes) return 0 ;;
+  esac
+  if pm_installed; then
+    step "Project Manager already installed — verifying instead of reinstalling"
+    return 0
+  fi
+  # No TTY (CI, piped): default to installing, so the platform is complete.
+  if [ ! -t 0 ]; then
+    warn "no TTY; installing pm without prompting"
+    return 0
+  fi
+  local reply
+  printf 'Install Project Manager (pm) too, so the agent can create sites on\n'
+  printf 'subdomains of %s with HTTPS? [Y/n] ' "$PM_PARENT" >&2
+  IFS= read -r reply || reply="y"
+  case "$(printf '%s' "$reply" | tr '[:upper:]' '[:lower:]')" in
+    ""|y|yes) return 0 ;;
+    *) step "Skipping pm; re-run with --with-pm to add it later"; return 1 ;;
+  esac
+}
+
+install_pm() {
+  [ -x "$PM_SCRIPT" ] || die "install-pm.sh not found next to this script ($PM_SCRIPT)"
+  # pm's wildcard must be the PARENT, not --domain. Asking for the parent here is
+  # what stops a mismatch between the DNS record the operator set and the one we
+  # verify; --pm-parent overrides when the parent is not the last two labels.
+  step "Installing Project Manager (pm) for parent domain $PM_PARENT"
+  # pm touches /etc, /opt, /srv and the Caddy gate, so it must run as root. Its
+  # own smoke test is redundant here: verify_pm() runs a combined one afterwards.
+  local -a pm_args=(--domain "$PM_PARENT" --parent "$PM_PARENT")
+  [ "$SKIP_DNS" -eq 1 ] && pm_args+=(--skip-dns-check)
+  [ "$PM_SKIP_SMOKE" -eq 1 ] && pm_args+=(--skip-smoke)
+  # pmd becomes the single on_demand_tls authorization gate. The OpenCode site
+  # itself is not a pm project, so without this Caddy would refuse its
+  # certificate and https://$DOMAIN would fail after pm takes over.
+  pm_args+=(--allow-domain "$DOMAIN")
+  if ! as_root bash "$PM_SCRIPT" "${pm_args[@]}"; then
+    die "pm installation failed (see the output above).
+    OpenCode 2 is installed and working; pm was not added. Fix the cause above
+    and re-run this same command to retry just pm."
+  fi
+  PM_INSTALLED=1
+  ok "pm installed and started"
+}
+
+# Restart OpenCode2 and wait for it to report pm connected.
+restart_opencode_for_mcp() {
+  step "Restarting OpenCode 2 to load the pm MCP server"
+  systemctl --user restart "$UNIT_NAME" >/dev/null 2>&1 \
+    || die "could not restart $UNIT_NAME after adding the pm MCP server"
+  local i state="starting"
+  for ((i = 1; i <= 30; i++)); do
+    state="$(unit_state)"
+    [ "$state" = "active" ] && break
+    sleep 1
+  done
+  [ "$state" = "active" ] || die "$UNIT_NAME did not return to active after restart (state=$state)"
+  ok "$UNIT_NAME active again"
+
+  # systemd reports "active" as soon as the process is up, but the HTTP API the
+  # MCP status lives behind needs a moment longer. Polling /api/mcp before the
+  # port is listening just burns the budget on connection failures and reports a
+  # false negative, so wait for the backend first.
+  local bcode
+  bcode="$(wait_backend)"
+  case "$bcode" in
+    2*|3*|401) ok "backend serving again: HTTP $bcode" ;;
+    *) die "backend did not come back after the pm MCP restart (got '${bcode:-none}')" ;;
+  esac
+
+  for ((i = 1; i <= 45; i++)); do
+    if pm_mcp_connected; then
+      ok "OpenCode 2 reports the pm MCP server connected"
+      return 0
+    fi
+    sleep 1
+  done
+  # A concrete reason beats "it didn't work": name both plausible causes.
+  die "OpenCode 2 did not report the pm MCP server as connected after 20s.
+    Config written: $(jq -c '.mcp.pm' "$PM_MCP_CONF" 2>/dev/null || echo MISSING)
+    Check: journalctl --user -u $UNIT_NAME -n 40 --no-pager | grep -i mcp"
+}
+
+# Combined smoke test: oc2d reachable, pmd healthy, MCP registered, and a real
+# project created over HTTPS through pm and then removed.
+verify_pm() {
+  step "Verifying the combined stack"
+  FAILS=0; WARNS=0; PASSES=0
+
+  if [ "$(as_root systemctl is-active "$PM_UNIT" 2>/dev/null || true)" = "active" ]; then
+    ok "$PM_UNIT is active (running)"; good
+  else bad "$PM_UNIT is '$(as_root systemctl is-active "$PM_UNIT" 2>/dev/null || echo inactive)'"; fi
+
+  if as_root systemctl is-enabled "$PM_UNIT" 2>/dev/null | grep -q enabled; then
+    ok "$PM_UNIT is enabled at boot"; good
+  else bad "$PM_UNIT is not enabled; it would not come back after a reboot"; fi
+
+  local health
+  if health="$(pm_health)"; then
+    ok "pm daemon healthy: $(printf '%s' "$health" | tr -d '\n')"; good
+  else bad "pm daemon did not answer /health on 127.0.0.1:8300"; fi
+
+  if jq -e '.mcp.pm.command | length > 0' "$PM_MCP_CONF" >/dev/null 2>&1; then
+    ok "pm MCP entry present in $PM_MCP_CONF"; good
+  else bad "pm MCP entry missing from $PM_MCP_CONF"; fi
+
+  if pm_mcp_connected; then
+    ok "OpenCode 2 has pm MCP connected"; good
+  else bad "OpenCode 2 does not report pm MCP connected"; fi
+
+  # pmd is the whole TLS gate now: if it does not authorize the OpenCode domain,
+  # Caddy silently stops issuing for it and the platform URL breaks. Check the
+  # gate directly, because the symptom (a TLS warning during verification) is
+  # easy to misread as slow provisioning.
+  local gate
+  gate="$(curl -fsS --max-time 5 -o /dev/null -w '%{http_code}' \
+    "http://127.0.0.1:8300/internal/check-domain?domain=${DOMAIN}" 2>/dev/null || echo 000)"
+  if [ "$gate" = "200" ]; then
+    ok "TLS gate authorizes $DOMAIN (pmd owns on_demand_tls)"; good
+  else
+    bad "the TLS gate refuses $DOMAIN (HTTP $gate).
+    pmd is Caddy's authorization gate, so Caddy will not issue a certificate
+    for $DOMAIN and the platform URL will not load over HTTPS.
+    Fix: add --allow-domain $DOMAIN to the pm install, then re-run:
+      sudo bash $PM_SCRIPT --domain $PM_PARENT --parent $PM_PARENT --allow-domain $DOMAIN
+      sudo systemctl restart $PM_UNIT"
+  fi
+
+  # Functional: create a real project, wait for HTTPS, then delete it. This is
+  # the only check that proves the whole chain — DNS, Caddy gate, cert issuance,
+  # systemd, route injection — works end to end.
+  local tok sub="smoke.$PM_PARENT" out
+  tok="$(as_root cat "$PM_TOKEN_FILE" 2>/dev/null | tr -d '[:space:]')"
+  if [ -z "$tok" ]; then
+    bad "no pm token at $PM_TOKEN_FILE"
+    audit_report
+    return 1
+  fi
+
+  # Clear any leftover from an interrupted run so the name is free.
+  curl -fsS --max-time 15 -X DELETE "http://127.0.0.1:8300/projects/smoke?purge=1" \
+    -H "Authorization: Bearer $tok" >/dev/null 2>&1 || true
+
+  step "Combined smoke test: creating '$sub'"
+  out="$(curl -fsS --max-time 180 -X POST http://127.0.0.1:8300/projects \
+    -H "Authorization: Bearer $tok" -H 'Content-Type: application/json' \
+    -d "{\"name\":\"smoke\",\"subdomain\":\"$sub\"}" 2>&1)" || true
+
+  if printf '%s' "$out" | jq -e '.httpsReady == true' >/dev/null 2>&1; then
+    ok "https://$sub served with a valid certificate"; good
+    printf '%s\n' "$out" | jq -r '.port' | while read -r p; do
+      [ -n "$p" ] && printf '       (loopback 127.0.0.1:%s)\n' "$p"
+    done
+  else
+    bad "could not create a project at https://$sub
+    $(printf '%s' "$out" | jq -r '.error // .' 2>/dev/null || printf '%s' "$out")
+    Check: journalctl -u $PM_UNIT -n 40 --no-pager"
+    curl -fsS --max-time 15 -X DELETE "http://127.0.0.1:8300/projects/smoke?purge=1" \
+      -H "Authorization: Bearer $tok" >/dev/null 2>&1 || true
+    audit_report
+    return 1
+  fi
+
+  step "Combined smoke test: removing the test project"
+  if curl -fsS --max-time 20 -X DELETE "http://127.0.0.1:8300/projects/smoke?purge=1" \
+       -H "Authorization: Bearer $tok" >/dev/null 2>&1; then
+    ok "test project removed (unit, files, state entry and Caddy route)"
+    good
+  else
+    bad "could not delete the smoke project"
+  fi
+
+  # oc2d regression: the platform itself must be untouched by all of the above.
+  local c; c="$(http_code "https://${DOMAIN}/")"
+  case "$c" in
+    2*|3*|401) ok "OpenCode 2 still serving after pm's changes: HTTP $c"; good ;;
+    000|"")   bad "https://$DOMAIN stopped responding after pm's changes" ;;
+    *)         soft "https://$DOMAIN returned HTTP $c" ;;
+  esac
+
+  audit_report
+}
+
 # --- verification ---
 # One probe. Never append a fallback value: curl already prints 000 on failure,
 # so "${code:-000}" would yield "000000" and defeat every guard below.
@@ -924,6 +1199,20 @@ print_summary() {
   issuer="$(cert_field -issuer)"
   notafter="$(cert_field -enddate)"
 
+  # pm block: state reflects what actually happened, so the summary can never
+  # claim a capability the machine does not have.
+  local pm_state="not installed" pm_line="" parent_line=""
+  if [ "$PM_INSTALLED" -eq 1 ]; then
+    pm_state="$(as_root systemctl is-active "$PM_UNIT" 2>/dev/null || echo unknown)"
+    if pm_mcp_connected; then
+      pm_line="pm_create, pm_list, pm_status, pm_start, pm_stop,
+                  pm_restart, pm_delete, pm_logs"
+    else
+      pm_line="configured but not connected — check: journalctl --user -u $UNIT_NAME | grep -i mcp"
+    fi
+    parent_line="$PM_PARENT   (wildcard *.$PM_PARENT)"
+  fi
+
   # A password is echoed back only when this run generated it. Anything the
   # operator chose, or a value reused from a previous install, is reported as
   # "as configured by user" so a re-run never reprints a live secret.
@@ -936,30 +1225,59 @@ print_summary() {
   cat <<EOF
 
 ========================================
- OpenCode 2 + Caddy — Installation Complete
+ Vibecoding Platform — Installed
 ========================================
- OpenCode Status:  $(systemctl --user is-active "$UNIT_NAME" 2>/dev/null || echo unknown)
- OpenCode PID:     $pid
- Caddy Status:     $(as_root systemctl is-active caddy 2>/dev/null || echo unknown)
- Domain:           https://$DOMAIN
- Backend:          http://127.0.0.1:$PORT  (loopback only)
- Certificate:      ${issuer:-issuer unknown}
-                   valid until ${notafter:-unknown}
- Password:         $pw_line   (login user "$SERVER_USER")
- Logs (OpenCode):  journalctl --user -u $UNIT_NAME -f
- Logs (Caddy):     journalctl -u caddy -f
- Restart (OpenCode): systemctl --user restart $UNIT_NAME
- Restart (Caddy):    sudo systemctl restart caddy
+ OpenCode 2:     $(systemctl --user is-active "$UNIT_NAME" 2>/dev/null || echo unknown)  (pid $pid)
+ URL:            https://$DOMAIN
+ Login:          $SERVER_USER / $pw_line
+ Backend:        http://127.0.0.1:$PORT  (loopback only)
+ Certificate:    ${issuer:-issuer unknown}
+                 valid until ${notafter:-unknown}
+ Caddy:          $(as_root systemctl is-active caddy 2>/dev/null || echo unknown)
+ PM daemon:      $pm_state
+ MCP tools:      $pm_line
+ Parent domain:  $parent_line
+
+ Logs (OpenCode): journalctl --user -u $UNIT_NAME -f
+ Logs (PM):       journalctl -u $PM_UNIT -f
+ Logs (Caddy):    journalctl -u caddy -f
 ========================================
 
-Open https://$DOMAIN in a browser and log in as user "$SERVER_USER".
-Renewal is automatic (Caddy reloads certs ~30 days before expiry).
-To change the password later, run: ./change-password.sh
-Remove with: bash install-opencode.sh --uninstall [--purge]
+Open https://$DOMAIN in a browser, log in as "$SERVER_USER", and chat with the
+agent. Try:
+
+  "Create a project called blog at blog.$PM_PARENT"
+  "List all my projects"
+  "Stop the blog project"
+  "Delete the demo project and clean up its files"
+
+Certificates are automatic (Caddy renews ~30 days before expiry).
+Change the password later with: ./change-password.sh
+Remove with:  bash install-opencode.sh --uninstall [--purge]
+Remove both:  bash install-opencode.sh --uninstall --with-pm [--purge]
 EOF
 }
 
+uninstall_pm() {
+  [ -f "$PM_SCRIPT" ] || { warn "install-pm.sh not found; remove pm manually"; return 0; }
+  step "Removing Project Manager (pm)"
+  # pm restores its own Caddy ask endpoint, drops the MCP entry and stops every
+  # project unit, so this is safe to run even when pm was never installed here.
+  local -a args=(--uninstall)
+  [ "$PURGE" -eq 1 ] && args+=(--purge)
+  [ -n "$PM_PARENT" ] && args+=(--parent "$PM_PARENT")
+  if as_root bash "$PM_SCRIPT" "${args[@]}"; then
+    ok "pm removed"
+  else
+    warn "pm uninstall reported errors; check 'systemctl status $PM_UNIT'"
+  fi
+}
+
 uninstall() {
+  # pm first: it restores the Caddy ask endpoint, so OpenCode's block stays
+  # consistent with whatever we hand control back to.
+  if [ "$WITH_PM" = "yes" ] || pm_installed; then uninstall_pm; fi
+
   step "Removing OpenCode 2"
   systemctl --user stop "$UNIT_NAME" 2>/dev/null || true
   systemctl --user disable "$UNIT_NAME" 2>/dev/null || true
@@ -1018,6 +1336,17 @@ main() {
   start_services
   verify_installation
   audit_stability
+
+  # pm comes after OpenCode is healthy: its MCP entry lands in OpenCode's config,
+  # and the combined verification needs both halves up.
+  if pm_should_install; then
+    install_pm
+    restart_opencode_for_mcp
+    verify_pm
+  else
+    PM_INSTALLED=0
+  fi
+
   print_summary
 }
 

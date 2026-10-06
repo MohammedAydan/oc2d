@@ -27,6 +27,13 @@ const CFG = {
 };
 const [PORT_LO, PORT_HI] = (process.env.PM_PORT_RANGE || '4096-5000').split('-').map(Number);
 
+// Extra hostnames pmd must authorize even though they are not pm projects.
+// pmd is the single on_demand_tls gate once installed, so anything else on the
+// box that needs a certificate — notably the OpenCode 2 site itself — has to be
+// listed here or Caddy refuses to issue for it and HTTPS breaks.
+const EXTRA_DOMAINS = (process.env.PM_ALLOW_DOMAINS || '')
+  .split(',').map((s) => s.trim().toLowerCase().replace(/\.+$/, '')).filter(Boolean);
+
 const NAME_RE = /^[a-z][a-z0-9-]{1,30}$/;
 const UNIT = (n) => `pm-${n}.service`;
 // pmd is root; projects are not. Resolve the uid:gid once so scaffold() can hand
@@ -157,6 +164,31 @@ const routeHost = (r) => (r && r.match && r.match.length === 1 && r.match[0].hos
  * Caddy's live config is in-memory, so this is also what restores routes after
  * a Caddy restart.
  */
+/**
+ * Reconcile state.json with what is actually on disk.
+ *
+ * An interrupted uninstall (or a hand-deleted unit) can leave state.json
+ * describing projects whose unit files are gone. Such entries would otherwise
+ * keep claiming a subdomain, hold a Caddy route open and hand the agent a
+ * project that can never start. Files are left alone for manual recovery; only
+ * the stale state entry and its route go.
+ */
+function reconcileState() {
+  const s = readState();
+  const before = s.projects.length;
+  const dropped = [];
+  s.projects = s.projects.filter((p) => {
+    if (fs.existsSync(path.join(CFG.unitsDir, UNIT(p.name)))) return true;
+    console.error(`pmd: dropping "${p.name}" — ${UNIT(p.name)} no longer exists`);
+    if (p.subdomain) dropped.push(p.subdomain);
+    return false;
+  });
+  if (s.projects.length !== before) writeState(s);
+  // The caller must feed these to caddySync: once a project left state.json its
+  // route is no longer recognised as ours and would be preserved forever.
+  return dropped;
+}
+
 async function caddySync(droppedSubdomains = []) {
   const servers = await caddy('GET', '/config/apps/http/servers');
   const srv = servers && Object.keys(servers)[0];
@@ -348,6 +380,7 @@ function readBody(req) {
 async function checkDomain(domain) {
   const d = (domain || '').toLowerCase().replace(/\.+$/, '');
   if (readState().projects.some((p) => p.subdomain === d)) return true;
+  if (EXTRA_DOMAINS.includes(d)) return true;
   if (!/^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$/.test(d)) return false;
 
   // Subdomains PM doesn't own are offered to the gate that was in place before
@@ -437,7 +470,12 @@ const server = http.createServer((req, res) => {
 });
 
 server.listen(CFG.port, '127.0.0.1', async () => {
-  const n = await caddySyncQuiet();
+  // Reconcile before the first route build, so a stale state entry cannot claim
+  // a subdomain on this startup.
+  let dropped = [];
+  try { dropped = reconcileState(); } catch (e) { console.error('pmd: reconcile:', e.message); }
+  const n = await caddySyncQuiet(dropped);
+  if (dropped.length) console.error(`pmd: dropped ${dropped.length} stale project(s) missing their unit`);
   console.log(`pmd listening on 127.0.0.1:${CFG.port} parent=${CFG.parent} caddy-routes=${n}`);
 });
 server.on('error', (e) => { console.error('pmd:', e.message); process.exit(1); });

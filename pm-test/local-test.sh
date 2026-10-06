@@ -2,7 +2,7 @@
 # pm local test suite — exercises the daemon and MCP server end to end without
 # touching the host: systemd, Caddy and /etc are all faked inside this directory.
 #
-#   ./pm/test/local-test.sh
+#   ./pm-test/local-test.sh
 #
 # Covers: HTTP surface + auth, the on_demand_tls gate (including delegation to a
 # pre-existing gate), create/start/stop/restart/delete, Caddy route build + route
@@ -54,6 +54,7 @@ export PM_TOKEN_FILE="$WORK/token" PM_PARENT="$PARENT" PM_PROJECTS_DIR="$WORK/pr
 export PM_UNITS_DIR="$WORK/units" PM_STATE="$WORK/state/state.json" PM_PORT=8391
 export PM_PORT_RANGE=4500-4600 PM_RUN_USER="$(id -un)" PM_CADDY_ADMIN=http://127.0.0.1:8390
 export PM_FALLBACK_ASKS=http://127.0.0.1:8399/internal/check-domain
+export PM_ALLOW_DOMAINS="opencode-site.$PARENT"
 export PM_TEST_RUNDIR="$WORK/run" PM_READY_TIMEOUT_MS=10000 PM_HTTPS_TIMEOUT_MS=1500
 
 node "$HERE/fake-services.js" >"$WORK/logs/fakes.log" 2>&1 &
@@ -86,6 +87,9 @@ gate() { curl -s -o "$WORK/body" -w '%{http_code}' "$API/internal/check-domain?d
 assert_eq "unknown domain is refused (403, no ACME burn)" 403 "$(gate random-$RANDOM.example.com)"
 assert_eq "domain outside the parent is refused" 403 "$(gate evil.com)"
 assert_eq "pre-existing gate still authorizes its own domain" 200 "$(gate legacy.example.com)"
+# PM_ALLOW_DOMAINS: pmd is Caddy's whole gate once installed, so a host's own
+# OpenCode site must be authorized explicitly or its certificate stops issuing.
+assert_eq "PM_ALLOW_DOMAINS host is authorized (the OpenCode site)" 200 "$(gate opencode-site.$PARENT)"
 assert_eq "gate also accepts POST {domain}" 200 \
 	"$(curl -s -o /dev/null -w '%{http_code}' -X POST "$API/internal/check-domain" -H 'Content-Type: application/json' -d '{"domain":"legacy.example.com"}')"
 
@@ -176,18 +180,36 @@ assert_eq "blog is untouched by the failed create" "blog" \
 	"$(jq -r '.projects[] | select(.name=="blog") | .name' "$WORK/state/state.json")"
 
 # ------------------------------------------------------------ restart test
-section "daemon restart re-asserts caddy routes from state.json"
+section "stale state entries are reconciled on daemon start"
+assert_eq "blog is in state before the test" "blog" \
+	"$(jq -r '.projects[] | select(.name=="blog") | .name' "$WORK/state/state.json")"
+# Simulate an interrupted uninstall: the unit file disappears but state.json and
+# the Caddy route remain. The next daemon start must drop the stale entry.
+rm -f "$WORK/units/pm-blog.service"
 cleanup_pid $PMD
-kill -9 "$(pgrep -f "$PM/daemon/index.js" | head -1)" 2>/dev/null
+node "$PM/daemon/index.js" >"$WORK/logs/pmd3.log" 2>&1 & PMD=$!
+for _ in $(seq 1 40); do curl -fsS --max-time 1 "$API/health" >/dev/null 2>&1 && break; sleep 0.25; done
+assert_eq "stale project dropped from state.json" 0 \
+	"$(jq '[.projects[] | select(.name=="blog")] | length' "$WORK/state/state.json")"
+assert_eq "its Caddy route was released" 0 "$(routes_of | grep -c "blog.$PARENT")"
+assert_eq "the gate refuses its subdomain" 403 "$(gate blog.$PARENT)"
+assert_has "the reason is logged" "no longer exists" "$(cat "$WORK/logs/pmd3.log")"
+
+section "daemon restart re-asserts caddy routes from state.json"
+# Recreate the project so there is something to rebuild.
+assert_eq "recreate blog is 201" 201 "$(status_of POST /projects '{"name":"blog"}')"
+BLOG_PORT="$(jqf 1 .port)"
+cleanup_pid $PMD
 node "$PM/daemon/index.js" >"$WORK/logs/pmd2.log" 2>&1 & PMD=$!
 for _ in $(seq 1 40); do curl -fsS --max-time 1 "$API/health" >/dev/null 2>&1 && break; sleep 0.25; done
 assert_eq "blog survived in state.json" "blog" "$(jq -r '.projects[0].name' "$WORK/state/state.json")"
 assert_has "route was rebuilt after the restart" "\"blog.$PARENT\"" "$(routes_of)"
+assert_has "route still dials the same port" "127.0.0.1:$BLOG_PORT" "$(routes_of)"
 assert_eq "pre-existing route still preserved" 1 "$(routes_of | grep -c somebody-elses)"
 
 # --------------------------------------------------------------- mcp server
 section "MCP server (stdio)"
-node "$PM/test/mcp-client.js" "$PM/mcp/index.js" "$TOKEN" "$API" >"$WORK/logs/mcp.log" 2>&1
+node "$HERE/mcp-client.js" "$PM/mcp/index.js" "$TOKEN" "$API" >"$WORK/logs/mcp.log" 2>&1
 MCP_RC=$?
 if [ "$MCP_RC" -eq 0 ]; then
 	while IFS= read -r line; do

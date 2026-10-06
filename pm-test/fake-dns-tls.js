@@ -50,6 +50,17 @@ const tls = https.createServer(creds, (req, res) => {
   res.writeHead(200, { 'content-type': 'text/html' });
   res.end('<h1>served over TLS</h1>\n');
 });
+// A leftover listener from a previous run is fine: it serves the same shim on the
+// same port, so the redirect still works. What must NOT happen is this shim
+// throwing and taking the daemon down with it -- that is what an unhandled
+// listen error does, and it turns a stale port into a confusing suite failure.
+tls.on('error', (e) => {
+  if (e.code === 'EADDRINUSE') {
+    process.stderr.write(`[fake-tls] port ${TLS_PORT} already served; reusing it\n`);
+    return;
+  }
+  process.stderr.write(`[fake-tls] ${e.message}\n`);
+});
 tls.listen(TLS_PORT, '127.0.0.1', () => {
   process.stderr.write(`[fake-tls] 127.0.0.1:${TLS_PORT} serves *${SUFFIX}\n`);
 });

@@ -2,6 +2,53 @@
 
 All notable changes to this project are documented here.
 
+## [0.2.1] — 2026-10-06
+
+Fixes four bugs in the unified installer, all reported from a fresh host. The
+pm parent domain is no longer derived from `--domain`, a missing wildcard skips pm
+cleanly instead of failing the install, and `as_root` no longer re-runs failing
+commands.
+
+### Fixed
+
+- **pm's parent is no longer derived from `--domain`.** `--domain
+  oc2d.example.com` produced parent `example.com`, a domain the operator never
+  configured, and the install then failed on a wildcard check for a record that
+  could not exist. The two are independent: `--domain` is the single host serving
+  OpenCode, while pm hands out subdomains of a separate parent. Resolution is now
+  `--pm-parent`, then `PM_PARENT` from a running `pmd`, then a `*.` Caddyfile block
+  that already resolves here, then an interactive prompt. Never guessed.
+- **A missing wildcard skips pm instead of failing the install.** The parent is
+  resolved and its wildcard verified *before* the "install pm?" question, so the
+  operator is not walked into a failure. When the records are absent the installer
+  prints exactly what to add, how to re-run, and continues — exit status 0, since
+  OpenCode 2 succeeded and pm is optional.
+- **`as_root` ran failing commands twice.** `sudo -n "$@" 2>/dev/null || sudo "$@"`
+  cannot tell "sudo needed a password" from "the command exited non-zero", so
+  every failing root command executed a second time. The duplicate `install-pm.sh`
+  output in the report was this, not a double invocation — and it also meant any
+  failing (or destructive) root command could run twice. Now the retry happens
+  only on a genuine authentication failure.
+- **A duplicate wildcard block could not be detected.** `grep -q "^[[:space:]]*\*.$P"`
+  matched nothing, because the unescaped `.` and `*` made the pattern a regex that
+  never hit. pm therefore appended `*.parent` to a file that already had one, and
+  Caddy rejected the whole config with "ambiguous site definition". Matching is
+  now `-F`, and an existing wildcard is reused after verifying it uses on-demand
+  TLS.
+- **Password handling.** Non-ASCII input is rejected with a specific message
+  instead of being reported as "shorter than 12 characters" (a single Arabic
+  character is 2 bytes, so the length check was measuring the wrong thing); the
+  weak-password grammar is corrected to "it is shorter than 12 characters"; length
+  is counted in characters rather than bytes; and the retry counter now counts
+  *rejected* passwords, so a confirmation typo no longer burns an attempt.
+
+### Added
+
+- `--pm-parent` is documented as required-when-undetectable, with the resolution
+  order spelled out and the reason it is never derived.
+- A distinct message when this host's public IP cannot be determined, instead of
+  claiming "DNS is not configured" when the truth is "unknown".
+
 ## [0.2.0] — 2026-10-06
 
 Unifies OpenCode 2 and the Project Manager into a single installer. One command

@@ -27,6 +27,7 @@ WITH_PM=""            # "" = auto-detect/prompt, "yes" = force, "no" = skip
 PM_PARENT=""          # parent domain pm may expose subdomains under
 PM_SKIP_SMOKE=0       # pm's own smoke test; the combined one still runs
 PM_INSTALLED=0        # set once pm is known to be present and wired
+PM_SKIPPED=""         # why pm was not installed, when it was not
 
 INSTALL_URL="https://opencode.ai/v2/install"      # V2 only; V1 is not wire-compatible
 LATEST_URL="https://opencode.ai/update/api/latest/cli/npm"
@@ -92,8 +93,10 @@ Install OpenCode 2 behind a Caddy reverse proxy with automatic HTTPS.
   --strict-port      Abort if the port is busy instead of auto-shifting
   --with-pm          Always install the Project Manager (pm), never prompt
   --without-pm       Never install pm
-  --pm-parent <d>    Parent domain pm may expose subdomains under
-                     (default: the last two labels of --domain)
+  --pm-parent <d>    Parent domain pm may expose subdomains under. REQUIRED to
+                     install pm unless it can be detected (an existing pm, or a
+                     wildcard in the Caddyfile that already points here). It is
+                     never guessed from --domain.
   --skip-pm-smoke    Let pm skip its own smoke test; the combined one still runs
   --uninstall        Remove the OpenCode unit and its Caddy site block
   --purge            With --uninstall, also delete the binary and config
@@ -159,16 +162,47 @@ parse_args() {
   if ! [[ "$PORT" =~ ^[0-9]+$ ]] || [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
     die "invalid --port: $PORT (expected 1-65535)"
   fi
-  # pm exposes subdomains of a PARENT; --domain is the OpenCode site itself.
-  # blog.example.com -> example.com.
-  if [ -z "$PM_PARENT" ]; then
-    PM_PARENT="$(printf '%s' "$DOMAIN" | awk -F. '{print $(NF-1)"."$NF}')"
-  fi
+  # pm's parent is NOT derived from --domain. The two are independent: --domain
+  # is the single host serving OpenCode, while pm hands out subdomains of a
+  # PARENT that needs its own wildcard record. Deriving it (oc2d.example.com ->
+  # example.com) invents a name the operator never configured, and the install
+  # then dies on a wildcard check for a record that does not exist. It is
+  # resolved later, by asking, in resolve_pm_parent().
+  PM_PARENT="${PM_PARENT,,}"
+  PM_PARENT="${PM_PARENT#\*.}"      # accept "*.apps.example.com"
+  PM_PARENT="${PM_PARENT%.}"
 }
 
 # --- sudo: non-interactive first so unattended runs never hang on a prompt ---
+# Retry on a PASSWORD PROMPT ONLY. Probing with `sudo -n "$@" || sudo "$@"` would
+# re-run any command that merely exited non-zero, so a failing (or destructive)
+# root command would execute twice. Distinguishing "sudo could not authenticate"
+# from "the command itself failed" is the whole point of this function.
+AS_ROOT_OK=1   # set once sudo is known to work without a prompt
 as_root() {
-  sudo -n "$@" 2>/dev/null || sudo "$@"
+  if [ "$AS_ROOT_OK" = 1 ]; then
+    sudo -n "$@"
+    return $?
+  fi
+  local out rc
+  # stderr carries the prompt; stdout is the command's own output and must pass
+  # through untouched, so they are captured separately.
+  out="$(mktemp)"
+  # shellcheck disable=SC2024  # the redirect is the shell's, not sudo's: we want
+  # the command's stdout captured either way.
+  sudo -n "$@" >"$out" 2>/dev/null
+  rc=$?
+  if [ "$rc" -eq 0 ]; then
+    cat "$out"; rm -f "$out"; return 0
+  fi
+  # Non-zero could mean "needs a password" or "command failed". Only a sudo
+  # specific message proves the former; anything else is a real failure and must
+  # NOT be retried.
+  if sudo -n -v 2>/dev/null; then
+    cat "$out"; rm -f "$out"; return "$rc"
+  fi
+  rm -f "$out"
+  sudo "$@"
 }
 
 check_prerequisites() {
@@ -517,9 +551,26 @@ password_blocked() {
 # The single-character-class cases are tested first so the message names the
 # actual problem ("is all digits") instead of a symptom of it ("contains no
 # lowercase letter").
+# Non-ASCII is rejected outright rather than judged on length: a single Arabic
+# or emoji character is 2-4 BYTES, so ${#pw} reads as a length problem when the
+# real one is the character set. OpenCode stores this in a systemd EnvironmentFile
+# and a plain HTTP Basic-Auth header, neither of which is byte-safe.
+password_non_ascii() {
+  local pw="$1"
+  LC_ALL=C printf '%s' "$pw" | grep -q '[^ -~]' && return 0
+  return 1
+}
+
 password_weak_reason() {
   local pw="$1"
-  if [ "${#pw}" -lt "$MIN_PASSWORD_LEN" ]; then printf 'shorter than %s characters' "$MIN_PASSWORD_LEN"; return 0; fi
+  # Length is counted in CHARACTERS, not bytes, so a non-ASCII password cannot be
+  # reported as merely short.
+  local chars
+  chars="$(LC_ALL=C.UTF-8 printf '%s' "$pw" | wc -m)"
+  chars=$((chars))   # strip any leading whitespace wc adds
+  if [ "$chars" -lt "$MIN_PASSWORD_LEN" ]; then
+    printf 'is shorter than %s characters' "$MIN_PASSWORD_LEN"; return 0
+  fi
   case "$pw" in *[!0-9]*) ;; *) printf 'is all digits'; return 0 ;; esac
   case "$pw" in *[!a-z]*) ;; *) printf 'is all lowercase letters'; return 0 ;; esac
   case "$pw" in *[!A-Z]*) ;; *) printf 'is all uppercase letters'; return 0 ;; esac
@@ -532,10 +583,12 @@ password_weak_reason() {
 
 # Reads the password twice with echo suppressed, so it never reaches the screen,
 # the scrollback or the shell history file.
+# The counter counts REJECTED passwords, not prompts: a confirmation mismatch is
+# a typo, not a refusal, and three mistypes must not lock the operator out of
+# their own install.
 prompt_password() {
   local attempt=0 pw pw2 reason
   while [ "$attempt" -lt "$MAX_PROMPT_ATTEMPTS" ]; do
-    attempt=$((attempt + 1))
     printf '%sEnter password for OpenCode (user: %s): %s' "$B" "$SERVER_USER" "$N" >&2
     IFS= read -r -s pw || die "could not read the password; aborting"
     printf '\n' >&2
@@ -547,12 +600,20 @@ prompt_password() {
       case "${reply,,}" in
         ""|y|yes) PASSWORD="$(generate_password)"; PW_SOURCE="generated"
                  ok "generated password: $PASSWORD"; return 0 ;;
-        *)        warn "password entry cancelled (attempt $attempt/$MAX_PROMPT_ATTEMPTS)"; continue ;;
+        *)        warn "cancelled. Re-enter a password, or leave it empty to generate one."; continue ;;
       esac
+    fi
+
+    # Non-ASCII first: it is a hard error, not a weakness to confirm past.
+    if password_non_ascii "$pw"; then
+      err "password must contain only ASCII characters (letters, digits, and symbols like ! @ # \$ % & * - _ . ?)."
+      attempt=$((attempt + 1))
+      continue
     fi
 
     if password_blocked "$pw"; then
       err "that password is on the blocklist (or is the username). Choose something else."
+      attempt=$((attempt + 1))
       continue
     fi
 
@@ -560,7 +621,9 @@ prompt_password() {
     IFS= read -r -s pw2 || die "could not read the confirmation; aborting"
     printf '\n' >&2
     if [ "$pw" != "$pw2" ]; then
-      err "passwords do not match (attempt $attempt/$MAX_PROMPT_ATTEMPTS)"
+      # A typo is not a rejected password: it must not burn an attempt, or three
+      # mistypes lock the operator out of their own install.
+      err "passwords do not match. Try again."
       continue
     fi
 
@@ -570,7 +633,8 @@ prompt_password() {
       ask "Use it anyway? [y/N] "
       case "${reply,,}" in
         y|yes) : ;;
-        *) warn "rejected (attempt $attempt/$MAX_PROMPT_ATTEMPTS)"; continue ;;
+        *) warn "rejected. (attempt $attempt/$MAX_PROMPT_ATTEMPTS)"
+           attempt=$((attempt + 1)); continue ;;
       esac
     fi
 
@@ -578,7 +642,7 @@ prompt_password() {
     ok "password accepted (as configured by user)"
     return 0
   done
-  die "no valid password after $MAX_PROMPT_ATTEMPTS attempts. Use --password or --generate-password for unattended runs."
+  die "no usable password after $MAX_PROMPT_ATTEMPTS rejected attempts. Use --password or --generate-password for unattended runs."
 }
 
 # Called from main() before any system change, so a bad password cannot leave a
@@ -773,6 +837,141 @@ pm_mcp_connected() {
 }
 
 
+# --- pm parent resolution ---------------------------------------------------
+# The wildcard check lives in install-pm.sh, but the operator must be asked
+# BEFORE that, not after: prompting "install pm?" and only then discovering the
+# parent has no wildcard record leads them straight into a failure. So resolve
+# and pre-check the parent here, and let install-pm.sh re-verify authoritatively.
+
+pm_probe_ip() {
+  dig +short "$1" A 2>/dev/null | tail -1
+}
+
+pm_public_ip() {
+  local ip
+  ip="$(curl -fsS --max-time 10 ifconfig.me 2>/dev/null | tr -d '[:space:]')" || ip=""
+  if [ -z "$ip" ]; then
+    ip="$(dig +short myip.opendns.com @resolver1.opendns.com 2>/dev/null | tail -1)"
+  fi
+  printf '%s' "$ip"
+}
+
+# A parent is usable only if a test label under it already resolves to this host.
+pm_parent_has_wildcard() {
+  local parent="$1" expect resolved
+  expect="${PUBLIC_IP:-}"
+  [ -n "$expect" ] || expect="$(pm_public_ip)"
+  [ -n "$expect" ] || return 2   # cannot tell -> do not claim it works
+  resolved="$(pm_probe_ip "pm-test-$$-$RANDOM.$parent")"
+  [ -n "$resolved" ] && [ "$resolved" = "$expect" ]
+}
+
+# Ask for the parent, explaining what it is and why it is not derivable.
+prompt_pm_parent() {
+  cat >&2 <<EOF
+
+pm hands out subdomains of a PARENT domain, and that parent needs its own
+wildcard DNS record. It is NOT derived from --domain: "$DOMAIN" is the single
+host serving OpenCode, and the wildcard usually lives somewhere else entirely
+(for example apps.example.com while OpenCode runs on code.example.com).
+
+EOF
+  local reply
+  while :; do
+    printf 'Parent domain that has a wildcard record pointing here: ' >&2
+    IFS= read -r reply || return 1
+    reply="${reply,,}"; reply="${reply#\*.}"; reply="${reply%.}"
+    [ -n "$reply" ] || { warn "please type a domain, or leave --with-pm off"; return 1; }
+    case "$reply" in
+      *.*.*) ;;
+      *) warn "'$reply' does not look like a parent domain (expected at least two labels)"; continue ;;
+    esac
+    case "$reply" in
+      *[!a-z0-9.-]*) warn "'$reply' contains characters that are not valid in a domain name"; continue ;;
+    esac
+    PM_PARENT="$reply"
+    return 0
+  done
+}
+
+# Resolve the pm parent, or return non-zero to skip pm entirely.
+resolve_pm_parent() {
+  # 1. Explicit flag wins.
+  if [ -n "$PM_PARENT" ]; then
+    return 0
+  fi
+  # 2. pm already installed: reuse what the running daemon is configured with.
+  if pm_installed; then
+    local running
+    running="$(as_root systemctl show pmd -p Environment --value 2>/dev/null |
+      sed -n 's/.*PM_PARENT=\([^ ]*\).*/\1/p' | head -1)"
+    if [ -n "$running" ]; then
+      PM_PARENT="$running"
+      step "pm parent taken from the running daemon: $PM_PARENT"
+      return 0
+    fi
+  fi
+  # 3. A wildcard block already in the Caddyfile is strong evidence.
+  if [ -f "$CADDYFILE" ]; then
+    local cand
+    for cand in $(as_root grep -oE '^\*\.?[a-z0-9.-]+ \{' "$CADDYFILE" 2>/dev/null |
+      sed -E 's/^\*\.?//; s/ \{$//' | sort -u); do
+      [ -n "$cand" ] || continue
+      if pm_parent_has_wildcard "$cand"; then
+        PM_PARENT="$cand"
+        step "pm parent detected from the existing wildcard block: $PM_PARENT"
+        return 0
+      fi
+    done
+  fi
+  # 4. Ask. Never guess.
+  if [ -t 0 ]; then
+    prompt_pm_parent || return 1
+    return 0
+  fi
+  warn "no TTY and no --pm-parent, so the pm parent cannot be determined.
+    Skipping pm. Re-run with:  --pm-parent <domain-with-wildcard>"
+  return 1
+}
+
+# Verify the parent BEFORE asking to install pm, so a missing wildcard is
+# reported as a skipped optional component rather than a failed install.
+pm_parent_precheck() {
+  step "Checking pm prerequisites (wildcard DNS for $PM_PARENT)"
+  local rc=0
+  pm_parent_has_wildcard "$PM_PARENT" || rc=$?
+  if [ "$rc" -eq 0 ]; then
+    ok "*.$PM_PARENT resolves to this host"
+    return 0
+  fi
+  if [ "$rc" -eq 2 ]; then
+    # Unknown: we could not learn this host's public IP, so we cannot compare.
+    # Claiming "DNS is not configured" here would be a guess dressed as a fact.
+    warn "could not determine this host's public IP, so the wildcard for *.$PM_PARENT
+    could not be verified. Skipping pm. Re-run with --skip-dns-check on
+    install-pm.sh if you are certain the records are correct."
+    return 1
+  fi
+  local expect
+  expect="$(pm_public_ip)"
+  cat >&2 <<EOF
+
+$(printf '%spm installation skipped: wildcard DNS is not configured for the parent domain.%s' "$Y" "$N")
+  *.$PM_PARENT does not resolve to this host, so pm could not serve subdomains.
+
+To install pm later, add these records at your DNS provider:
+  A    $PM_PARENT     -> ${expect:-THIS_SERVER_IP}
+  A    *.$PM_PARENT   -> ${expect:-THIS_SERVER_IP}
+
+Then re-run:
+  ./install-opencode.sh --domain $DOMAIN --pm-parent $PM_PARENT
+
+OpenCode 2 is installed and working; only the optional pm component was skipped.
+
+EOF
+  return 1
+}
+
 # Decide whether pm should be installed, honouring the flags and never prompting
 # twice.
 pm_should_install() {
@@ -784,18 +983,26 @@ pm_should_install() {
     step "Project Manager already installed — verifying instead of reinstalling"
     return 0
   fi
-  # No TTY (CI, piped): default to installing, so the platform is complete.
+  # No TTY (CI, piped): install only when the parent is already known good.
   if [ ! -t 0 ]; then
-    warn "no TTY; installing pm without prompting"
-    return 0
+    if [ -n "$PM_PARENT" ] && pm_parent_has_wildcard "$PM_PARENT"; then
+      return 0
+    fi
+    if [ -z "$PM_PARENT" ]; then
+      warn "no TTY and no --pm-parent, so the pm parent is unknown; skipping pm.
+    Re-run with:  --pm-parent <domain-with-wildcard>"
+    else
+      warn "no TTY and *.$PM_PARENT does not resolve here; skipping pm"
+    fi
+    return 1
   fi
   local reply
   printf 'Install Project Manager (pm) too, so the agent can create sites on\n'
-  printf 'subdomains of %s with HTTPS? [Y/n] ' "$PM_PARENT" >&2
+  printf 'subdomains of a parent domain, each with HTTPS? [Y/n] ' >&2
   IFS= read -r reply || reply="y"
   case "$(printf '%s' "$reply" | tr '[:upper:]' '[:lower:]')" in
     ""|y|yes) return 0 ;;
-    *) step "Skipping pm; re-run with --with-pm to add it later"; return 1 ;;
+    *) step "Skipping pm; re-run with --with-pm --pm-parent <domain> to add it later"; return 1 ;;
   esac
 }
 
@@ -807,6 +1014,8 @@ install_pm() {
   step "Installing Project Manager (pm) for parent domain $PM_PARENT"
   # pm touches /etc, /opt, /srv and the Caddy gate, so it must run as root. Its
   # own smoke test is redundant here: verify_pm() runs a combined one afterwards.
+  # Exactly one invocation: the wrapper prints its own step banners, and calling
+  # install-pm.sh twice would duplicate every line of its output.
   local -a pm_args=(--domain "$PM_PARENT" --parent "$PM_PARENT")
   [ "$SKIP_DNS" -eq 1 ] && pm_args+=(--skip-dns-check)
   [ "$PM_SKIP_SMOKE" -eq 1 ] && pm_args+=(--skip-smoke)
@@ -1202,7 +1411,9 @@ print_summary() {
   # pm block: state reflects what actually happened, so the summary can never
   # claim a capability the machine does not have.
   local pm_state="not installed" pm_line="" parent_line=""
-  if [ "$PM_INSTALLED" -eq 1 ]; then
+  if [ -n "$PM_SKIPPED" ]; then
+    pm_state="skipped ($PM_SKIPPED)"
+  elif [ "$PM_INSTALLED" -eq 1 ]; then
     pm_state="$(as_root systemctl is-active "$PM_UNIT" 2>/dev/null || echo unknown)"
     if pm_mcp_connected; then
       pm_line="pm_create, pm_list, pm_status, pm_start, pm_stop,
@@ -1339,10 +1550,24 @@ main() {
 
   # pm comes after OpenCode is healthy: its MCP entry lands in OpenCode's config,
   # and the combined verification needs both halves up.
-  if pm_should_install; then
-    install_pm
-    restart_opencode_for_mcp
-    verify_pm
+  #
+  # Order matters: resolve the parent, then pre-check its wildcard, and only then
+  # ask whether to install. Asking first and discovering a missing DNS record
+  # afterwards walks the operator into a failure, and a failed optional component
+  # must never fail the install that already succeeded.
+  if [ "$WITH_PM" != "no" ] || pm_installed; then
+    if resolve_pm_parent && pm_parent_precheck; then
+      if pm_should_install; then
+        install_pm
+        restart_opencode_for_mcp
+        verify_pm
+      else
+        PM_INSTALLED=0
+      fi
+    else
+      PM_INSTALLED=0
+      PM_SKIPPED="pm (no usable parent domain)"
+    fi
   else
     PM_INSTALLED=0
   fi

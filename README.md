@@ -64,7 +64,7 @@ config and credentials.
 | `--strict-port` | off | Abort on a busy port instead of auto-shifting |
 | `--with-pm` | auto | Always install pm, never prompt |
 | `--without-pm` | auto | Never install pm |
-| `--pm-parent <d>` | last two labels of `--domain` | Parent domain pm may expose subdomains under |
+| `--pm-parent <d>` | detected, else prompted | Parent domain pm may expose subdomains under. Never guessed from `--domain` |
 | `--skip-pm-smoke` | off | Let pm skip its own smoke test; the combined one still runs |
 | `--uninstall` | | Remove the user unit and the domain's Caddy block |
 | `--purge` | | With `--uninstall`, also delete the binary and password |
@@ -77,15 +77,34 @@ Env: `OPENCODE_PASSWORD` sets the password when no password flag is given.
 You are asked once whether to install pm, unless `--with-pm` / `--without-pm`
 says so. If `pmd.service` already exists it is re-verified, never reinstalled.
 
-pm manages a **parent domain** — `--domain blog.example.com` implies the parent
-`example.com` — and hands out subdomains of it. That needs a wildcard DNS record:
+### The parent domain is not derived from `--domain`
+
+These are independent, and conflating them is the single most common way to get a
+failed install:
+
+- `--domain code.example.com` — the one host serving OpenCode
+- pm's **parent** — a domain with a wildcard record, whose *subdomains* pm hands out
+
+The parent is often somewhere else entirely (OpenCode on `oc2d.example.com`
+while pm serves `blog.apps.example.com`). So it is resolved in this order, never
+guessed:
+
+1. `--pm-parent`, if given
+2. `PM_PARENT` from an already-running `pmd.service`
+3. a `*.` block already in the Caddyfile whose wildcard resolves to this host
+4. an interactive prompt explaining exactly what it is
+5. otherwise pm is **skipped** with the records to add — OpenCode still installs
+
+A parent needs a wildcard DNS record pointing here:
 
 ```
-A    example.com     -> this server
-A    *.example.com   -> this server
+A    apps.example.com     -> this server
+A    *.apps.example.com   -> this server
 ```
 
-Pass `--pm-parent` when the parent is not the last two labels of `--domain`.
+If the wildcard is missing the installer says so and tells you the exact records,
+rather than failing an install that already succeeded. Exit status stays 0: pm is
+optional, OpenCode 2 is the component that must not be broken.
 
 | Tool the agent can call | Effect |
 |---|---|

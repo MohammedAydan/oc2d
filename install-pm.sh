@@ -267,8 +267,29 @@ fi
 
 # The wildcard site block. Real upstreams are injected through Caddy's admin API
 # per project; this block only serves the TLS policy and a sane 404 fallback.
-if grep -q "$PREFIX" "$CADDYFILE"; then
+#
+# A wildcard block can only exist ONCE: Caddy rejects a second *.parent block
+# with "ambiguous site definition". The parent may already be covered by a block
+# this installer did not write (another tool, or a hand-written block), in which
+# case adding ours would break the whole config.
+WILDCARD_BLOCK="*.${PARENT} {"
+if grep -qF "$PREFIX" "$CADDYFILE"; then
 	ok "wildcard site block already present"
+elif grep -qF "${WILDCARD_BLOCK}" "$CADDYFILE"; then
+	# Already covered. Validate that the existing one keeps the on-demand policy
+	# pm depends on; if not, say so rather than silently shipping a broken TLS
+	# path for every pm subdomain.
+	# -F and no ^ anchor: the pattern contains regex metacharacters (* . {) that
+	# make an anchored pattern silently match nothing, which would report a false
+	# "does not use on-demand TLS".
+	if grep -F -A8 "${WILDCARD_BLOCK}" "$CADDYFILE" | grep -q 'on_demand'; then
+		ok "wildcard *.$PARENT already exists (not pm's) with on-demand TLS; reusing it"
+	else
+		warn "*.$PARENT already exists but does NOT use on-demand TLS.
+      pm needs on-demand TLS so certificates are issued per subdomain.
+      Add 'tls { on_demand }' to that block, or pm subdomains will not get
+      certificates."
+	fi
 else
 	{
 		printf '\n%s — projects on *.%s\n' "$PREFIX" "$PARENT"

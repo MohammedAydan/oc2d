@@ -100,6 +100,23 @@ assert_has "bad name explains the rule" 'want ^[a-z][a-z0-9-]{1,30}$' "$(jqf 1 .
 assert_eq "subdomain outside the parent is 400" 400 \
 	"$(status_of POST /projects '{"name":"stray","subdomain":"stray.evil.com"}')"
 
+# A body that is not JSON must be reported as such. Previously readBody()
+# resolved `{}` on a parse failure, so createProject() received an empty object
+# and answered "invalid name" — blaming a field the caller never sent.
+assert_eq "malformed JSON is 400" 400 \
+	"$(curl -s -o "$WORK/body" -w '%{http_code}' -X POST "$API/projects" \
+		-H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d 'not json')"
+assert_has "malformed JSON says so" 'not valid JSON' \
+	"$(jq -r '.error' < "$WORK/body" 2>/dev/null)"
+case "$(jq -r '.error // ""' < "$WORK/body" 2>/dev/null)" in
+	*'invalid name'*) fail "malformed JSON does NOT blame the name" \
+		"error was: $(jq -r '.error' < "$WORK/body" 2>/dev/null)" ;;
+	*) pass "malformed JSON does NOT blame the name" ;;
+esac
+# An empty body is still a valid empty object, so the *name* rule is what applies.
+assert_eq "empty body is 400 with the name rule" 400 "$(status_of POST /projects '')"
+assert_has "empty body explains the name rule" 'want ^[a-z][a-z0-9-]{1,30}$' "$(jqf 1 .error)"
+
 # ------------------------------------------------------------------ create
 section "create: blog"
 assert_eq "POST /projects is 201" 201 "$(status_of POST /projects "{\"name\":\"blog\",\"subdomain\":\"blog.$PARENT\"}")"

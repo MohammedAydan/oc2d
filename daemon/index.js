@@ -360,15 +360,30 @@ function json(res, code, body) {
   res.end(b);
 }
 
+// An empty body is an empty object (several endpoints legitimately take none),
+// but a body that is present and not JSON is a client error and must say so.
+// Resolving `{}` there would hand createProject() an empty object and report
+// "invalid name", blaming the field the caller never sent.
 function readBody(req) {
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     let raw = '';
-    req.on('data', (d) => { raw += d; if (raw.length > 1e6) req.destroy(); });
-    req.on('end', () => {
-      if (!raw) return resolve({});
-      try { resolve(JSON.parse(raw)); } catch { resolve({}); }
+    let tooLarge = false;
+    req.on('data', (d) => {
+      // Keep draining rather than destroying the socket: destroying mid-upload
+      // leaves the client with a connection reset and no status code at all.
+      // Draining lets us answer 413 properly; the daemon stays loopback-only,
+      // so the discarded upload is bounded by the client, not by exposure.
+      if (tooLarge) return;
+      raw += d;
+      if (raw.length > 1e6) tooLarge = true;
     });
-    req.on('error', () => resolve({}));
+    req.on('end', () => {
+      if (tooLarge) return reject(Object.assign(new Error('request body too large (max 1MB)'), { status: 413 }));
+      if (!raw.trim()) return resolve({});
+      try { resolve(JSON.parse(raw)); }
+      catch { reject(Object.assign(new Error('request body is not valid JSON'), { status: 400 })); }
+    });
+    req.on('error', () => reject(Object.assign(new Error('could not read request body'), { status: 400 })));
   });
 }
 
